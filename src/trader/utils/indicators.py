@@ -413,6 +413,172 @@ def calculate_kdj(
     return result
 
 
+class ADXResult(BaseModel):
+    """Result container for ADX indicator."""
+    adx: Optional[Decimal] = Field(default=None, description="ADX value (0-100)")
+    plus_di: Optional[Decimal] = Field(default=None, description="+DI (Positive Directional Indicator)")
+    minus_di: Optional[Decimal] = Field(default=None, description="-DI (Negative Directional Indicator)")
+
+
+def calculate_adx(
+    highs: List[Decimal],
+    lows: List[Decimal],
+    closes: List[Decimal],
+    period: int = 14,
+) -> List[ADXResult]:
+    """Calculate Average Directional Index (ADX).
+
+    Simplified ADX calculation using Wilder's smoothing method.
+
+    Args:
+        highs: List of high prices
+        lows: List of low prices
+        closes: List of close prices
+        period: ADX period (default: 14)
+
+    Returns:
+        List of ADXResult objects
+    """
+    if period <= 0:
+        raise ValueError("Period must be positive")
+
+    if len(highs) != len(lows) or len(highs) != len(closes):
+        raise ValueError("All price lists must have the same length")
+
+    n = len(highs)
+    result = [ADXResult() for _ in range(n)]
+
+    # Need at least 2 * period + 1 data points for full ADX
+    min_required = 2 * period + 1
+    if n < min_required:
+        return result
+
+    # Step 1: Calculate True Range (TR), +DM, -DM
+    tr = [Decimal("0")] * n
+    plus_dm = [Decimal("0")] * n
+    minus_dm = [Decimal("0")] * n
+
+    for i in range(1, n):
+        # True Range
+        hl = highs[i] - lows[i]
+        hc = abs(highs[i] - closes[i - 1])
+        lc = abs(lows[i] - closes[i - 1])
+        tr[i] = max(hl, hc, lc)
+
+        # Directional Movement
+        up = highs[i] - highs[i - 1]
+        down = lows[i - 1] - lows[i]
+
+        if up > down and up > Decimal("0"):
+            plus_dm[i] = up
+        else:
+            plus_dm[i] = Decimal("0")
+
+        if down > up and down > Decimal("0"):
+            minus_dm[i] = down
+        else:
+            minus_dm[i] = Decimal("0")
+
+    # Step 2: Calculate smoothed TR, +DM, -DM using Wilder's method
+    smoothed_tr = [Decimal("0")] * n
+    smoothed_plus_dm = [Decimal("0")] * n
+    smoothed_minus_dm = [Decimal("0")] * n
+
+    # Initial smoothing (sum of first period values)
+    smoothed_tr[period] = sum(tr[1 : period + 1])
+    smoothed_plus_dm[period] = sum(plus_dm[1 : period + 1])
+    smoothed_minus_dm[period] = sum(minus_dm[1 : period + 1])
+
+    # Subsequent smoothing
+    for i in range(period + 1, n):
+        smoothed_tr[i] = smoothed_tr[i - 1] - (smoothed_tr[i - 1] / Decimal(str(period))) + tr[i]
+        smoothed_plus_dm[i] = smoothed_plus_dm[i - 1] - (smoothed_plus_dm[i - 1] / Decimal(str(period))) + plus_dm[i]
+        smoothed_minus_dm[i] = smoothed_minus_dm[i - 1] - (smoothed_minus_dm[i - 1] / Decimal(str(period))) + minus_dm[i]
+
+    # Step 3: Calculate +DI, -DI, DX
+    pdi = [Decimal("0")] * n
+    mdi = [Decimal("0")] * n
+    dx = [Decimal("0")] * n
+
+    for i in range(period, n):
+        if smoothed_tr[i] != Decimal("0"):
+            pdi[i] = (smoothed_plus_dm[i] / smoothed_tr[i]) * Decimal("100")
+            mdi[i] = (smoothed_minus_dm[i] / smoothed_tr[i]) * Decimal("100")
+
+            di_sum = pdi[i] + mdi[i]
+            if di_sum != Decimal("0"):
+                di_diff = abs(pdi[i] - mdi[i])
+                dx[i] = (di_diff / di_sum) * Decimal("100")
+
+    # Step 4: Calculate ADX (smoothed DX)
+    adx = [Decimal("0")] * n
+
+    # Initial ADX (average of first period DX values starting from period)
+    if n > 2 * period:
+        adx[2 * period] = sum(dx[period + 1 : 2 * period + 1]) / Decimal(str(period))
+
+        # Subsequent ADX values
+        for i in range(2 * period + 1, n):
+            adx[i] = (adx[i - 1] * Decimal(str(period - 1)) + dx[i]) / Decimal(str(period))
+
+    # Populate results with None for insufficient data
+    for i in range(n):
+        result_adx: Optional[Decimal] = None
+        result_pdi: Optional[Decimal] = None
+        result_mdi: Optional[Decimal] = None
+
+        if i >= period:
+            result_pdi = pdi[i]
+            result_mdi = mdi[i]
+
+        if i >= 2 * period:
+            result_adx = adx[i]
+
+        result[i] = ADXResult(
+            adx=result_adx,
+            plus_di=result_pdi,
+            minus_di=result_mdi,
+        )
+
+    return result
+
+
+def calculate_zscore(data: List[Decimal], period: int = 20) -> List[Optional[Decimal]]:
+    """Calculate Z-Score for a data series.
+
+    Z-Score = (Value - Mean) / Standard Deviation
+
+    Args:
+        data: List of data points
+        period: Lookback period for mean and std dev calculation
+
+    Returns:
+        List of Z-Score values, with None for the first (period-1) values
+    """
+    if period <= 0:
+        raise ValueError("Period must be positive")
+
+    result: List[Optional[Decimal]] = [None] * len(data)
+
+    if len(data) < period:
+        return result
+
+    for i in range(period - 1, len(data)):
+        window = data[i - period + 1: i + 1]
+        mean = sum(window) / Decimal(str(period))
+
+        # Calculate standard deviation
+        variance = sum((x - mean) ** 2 for x in window) / Decimal(str(period))
+        std = variance.sqrt()
+
+        if std != Decimal("0"):
+            result[i] = (data[i] - mean) / std
+        else:
+            result[i] = Decimal("0")
+
+    return result
+
+
 class StreamingIndicator:
     """Base class for streaming indicators with incremental updates.
     
@@ -554,6 +720,56 @@ class StreamingKDJ:
         return results[-1] if results else None
 
 
+class StreamingADX:
+    """Streaming ADX indicator (requires high/low/close)."""
+
+    def __init__(
+        self,
+        period: int = 14,
+        window_size: int = 100,
+    ):
+        self.period = period
+        self.window_size = window_size
+        self._highs: List[Decimal] = []
+        self._lows: List[Decimal] = []
+        self._closes: List[Decimal] = []
+
+    def update(self, high: Decimal, low: Decimal, close: Decimal) -> None:
+        """Add new OHLC data.
+        
+        Args:
+            high: High price
+            low: Low price
+            close: Close price
+        """
+        self._highs.append(high)
+        self._lows.append(low)
+        self._closes.append(close)
+
+        if len(self._highs) > self.window_size:
+            self._highs.pop(0)
+            self._lows.pop(0)
+            self._closes.pop(0)
+
+    def get_current(self) -> Optional[ADXResult]:
+        """Get current ADX value.
+        
+        Returns:
+            ADXResult or None if insufficient data
+        """
+        min_required = 2 * self.period + 1
+        if len(self._highs) < min_required:
+            return None
+
+        results = calculate_adx(
+            self._highs,
+            self._lows,
+            self._closes,
+            self.period,
+        )
+        return results[-1] if results else None
+
+
 class TechnicalIndicators(BaseModel):
     """Container for technical indicators."""
     sma_short: Optional[Decimal] = Field(default=None, description="Short-term SMA")
@@ -565,6 +781,8 @@ class TechnicalIndicators(BaseModel):
     bollinger: Optional[BollingerBandsResult] = Field(default=None, description="Bollinger Bands")
     macd: Optional[MACDResult] = Field(default=None, description="MACD")
     kdj: Optional[KDJResult] = Field(default=None, description="KDJ")
+    adx: Optional[ADXResult] = Field(default=None, description="ADX (Average Directional Index)")
+    zscore: Optional[Decimal] = Field(default=None, description="Z-Score")
 
 
 def calculate_all_indicators(
@@ -586,6 +804,8 @@ def calculate_all_indicators(
     kdj_rsv: int = 9,
     kdj_k: int = 3,
     kdj_d: int = 3,
+    adx_period: int = 14,
+    zscore_period: int = 20,
 ) -> List[TechnicalIndicators]:
     """Calculate all technical indicators for a price series.
 
@@ -608,6 +828,8 @@ def calculate_all_indicators(
         kdj_rsv: KDJ RSV period (default: 9)
         kdj_k: KDJ K line period (default: 3)
         kdj_d: KDJ D line period (default: 3)
+        adx_period: ADX period (default: 14)
+        zscore_period: Z-Score period (default: 20)
 
     Returns:
         List of TechnicalIndicators objects, one for each data point
@@ -622,6 +844,8 @@ def calculate_all_indicators(
     bollinger = calculate_bollinger_bands(prices, bollinger_period, bollinger_std)
     macd = calculate_macd(prices, macd_fast, macd_slow, macd_signal)
     kdj = calculate_kdj(highs, lows, closes, kdj_rsv, kdj_k, kdj_d)
+    adx = calculate_adx(highs, lows, closes, adx_period)
+    zscore = calculate_zscore(prices, zscore_period)
 
     # Combine into TechnicalIndicators objects
     indicators_list = []
@@ -636,6 +860,8 @@ def calculate_all_indicators(
             bollinger=bollinger[i] if i < len(bollinger) else None,
             macd=macd[i] if i < len(macd) else None,
             kdj=kdj[i] if i < len(kdj) else None,
+            adx=adx[i] if i < len(adx) else None,
+            zscore=zscore[i],
         )
         indicators_list.append(indicators)
 

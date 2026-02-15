@@ -64,7 +64,7 @@ class RealBroker:
         # Load environment variables
         load_dotenv(env_file)
 
-        # Initialize exchange
+        # Initialize exchange - use binance spot testnet (testnet.binance.vision)
         api_key = os.getenv("BINANCE_API_KEY") or ""
         api_secret = os.getenv("BINANCE_API_SECRET") or ""
         self.exchange = ccxt.binance(

@@ -16,18 +16,23 @@ from .data_repository import BarData, FundingRateData
 class DataDownloader:
     """Use CCXT to download historical data from exchanges."""
     
-    def __init__(self, exchange_name: str = "binance", env_file: str = ".env.dev"):
+    def __init__(self, exchange_name: str = "binance", env_file: str = ".env.dev", testnet: bool = False):
         """Initialize data downloader.
         
         Args:
-            exchange_name: Name of the exchange (e.g., "binance", "okx")
+            exchange_name: Name of the exchange (default: "binance" for spot)
             env_file: Path to environment file for proxy configuration
+            testnet: Whether to use testnet/sandbox mode (default: False)
         """
         # Load environment variables (this sets HTTP_PROXY/HTTPS_PROXY which requests will use)
         load_dotenv(env_file)
         
-        # Initialize exchange - requests library will automatically use HTTP_PROXY/HTTPS_PROXY env vars
+        # Initialize exchange - use binance spot
         self.exchange = getattr(ccxt, exchange_name)()
+        
+        # Enable testnet/sandbox mode if requested
+        if testnet:
+            self.exchange.set_sandbox_mode(True)
     
     def download_ohlcv(
         self,
