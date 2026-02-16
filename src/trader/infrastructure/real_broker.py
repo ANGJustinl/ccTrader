@@ -34,6 +34,7 @@ class RealBroker:
         event_bus: EventBus,
         env_file: str = ".env.dev",
         testnet: bool = True,
+        market_type: str = "future",  # "spot" or "future"
         risk_manager: Optional[RiskManager] = None,
         state_persistence: Optional[StatePersistence] = None,
     ):
@@ -43,6 +44,7 @@ class RealBroker:
             event_bus: Event bus for publishing/subscribing events
             env_file: Path to environment file with API keys
             testnet: Whether to use testnet (default: True)
+            market_type: Market type (default: "future")
             risk_manager: Risk manager instance (optional)
             state_persistence: State persistence instance (optional)
         """
@@ -61,25 +63,61 @@ class RealBroker:
         self._sync_running = False
         self._sync_interval = 5
 
+        self.market_type = market_type
+        self.testnet = testnet
+
         # Load environment variables
         load_dotenv(env_file)
 
         # Initialize exchange - use binance spot testnet (testnet.binance.vision)
+        # or futures testnet (testnet.binancefuture.com)
         api_key = os.getenv("BINANCE_API_KEY") or ""
         api_secret = os.getenv("BINANCE_API_SECRET") or ""
-        self.exchange = ccxt.binance(
-            {
-                "apiKey": api_key,
-                "secret": api_secret,
-                "enableRateLimit": True,
+        
+        # Configure endpoints based on testnet/market_type
+        # Demo Testnet Futures keys are different from Spot Testnet keys usually.
+        # Ensure user provides correct keys in .env
+        
+        if testnet and market_type == "future":
+             # Use specific Futures Testnet keys if available, else fall back to default
+             api_key = os.getenv("BINANCE_DEMO_API_KEY") or api_key
+             api_secret = os.getenv("BINANCE_DEMO_API_SECRET") or api_secret
+             
+        exchange_config = {
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+            "options": {
+                "defaultType": market_type,
             }
-        )
+        }
+
+        # Manual override for Futures Testnet (CCXT deprecated sandbox mode for futures)
+        if testnet and market_type == "future":
+             exchange_config["urls"] = {
+                 'api': {
+                     'fapiPublic': 'https://testnet.binancefuture.com/fapi/v1',
+                     'fapiPrivate': 'https://testnet.binancefuture.com/fapi/v1',
+                     'fapiPrivateV2': 'https://testnet.binancefuture.com/fapi/v2',
+                 },
+                 'test': {
+                     'fapiPublic': 'https://testnet.binancefuture.com/fapi/v1',
+                     'fapiPrivate': 'https://testnet.binancefuture.com/fapi/v1',
+                     'fapiPrivateV2': 'https://testnet.binancefuture.com/fapi/v2',
+                 }
+             }
+
+        self.exchange = ccxt.binance(exchange_config)
 
         if testnet:
-            self.exchange.set_sandbox_mode(True)
-            print("⚠️ [REAL] Using Binance Testnet (Sandbox Mode)")
+            if market_type == "future":
+                # Do NOT call set_sandbox_mode(True) for futures as it's deprecated/blocked
+                print(f"⚠️ [REAL] Using Binance FUTURE Testnet (Manual URL Override)")
+            else:
+                self.exchange.set_sandbox_mode(True)
+                print(f"⚠️ [REAL] Using Binance SPOT Testnet (Sandbox Mode)")
         else:
-            print("⚠️ [REAL] WARNING: Using LIVE Binance Exchange!")
+            print(f"⚠️ [REAL] WARNING: Using LIVE Binance {market_type.upper()} Exchange!")
 
         # Local cache
         self.positions: Dict[str, Position] = {}  # symbol -> Position
@@ -145,13 +183,45 @@ class RealBroker:
             # Submit order to exchange
             print(f"📝 [REAL] 提交订单: {order.side.upper()} {order.quantity} {order.symbol} @ {order.price or 'MARKET'}")
 
-            exchange_order = self.exchange.create_order(  # type: ignore
-                symbol=binance_symbol,
-                type=type_,
-                side=side,
-                amount=float(order.quantity),
-                **params
-            )
+            exchange_order = None
+            
+            # Special handling for Futures Testnet
+            if self.testnet and self.market_type == "future":
+                try:
+                    # Construct raw params
+                    fapi_params = {
+                        "symbol": binance_symbol,
+                        "side": side.upper(),
+                        "type": type_.upper(),
+                        "quantity": round(float(order.quantity), 3),  # ETH qty precision: 3
+                    }
+                    if order.order_type == "limit":
+                        fapi_params["price"] = round(float(order.price), 2)  # ETH price precision: 2
+                        fapi_params["timeInForce"] = "GTC"
+                    
+                    print(f"🔍 [REAL] Raw Submit: {fapi_params}")
+                    raw_order = self.exchange.fapiPrivatePostOrder(fapi_params)
+                    
+                    # Convert raw response to ccxt-like structure for handle_order_fill
+                    exchange_order = {
+                        "id": str(raw_order["orderId"]),
+                        "status": raw_order["status"].lower(),
+                        "filled": float(raw_order.get("executedQty", 0)),
+                        "price": float(raw_order.get("avgPrice", 0)),
+                        "timestamp": raw_order.get("updateTime", self.clock.now().timestamp() * 1000),
+                        # Raw response might not have 'trades' immediately
+                    }
+                except Exception as e:
+                    print(f"❌ [REAL] Raw Submit Failed: {e}")
+                    raise e
+            else:
+                exchange_order = self.exchange.create_order(  # type: ignore
+                    symbol=binance_symbol,
+                    type=type_,
+                    side=side,
+                    amount=float(order.quantity),
+                    **params
+                )
 
             # Debug log: print full exchange order response
             print(f"🔍 [REAL] Exchange order response: status={exchange_order.get('status')}, filled={exchange_order.get('filled')}, id={exchange_order.get('id')}")
@@ -284,7 +354,7 @@ class RealBroker:
                 price=fill_price,
                 quantity=fill_quantity,
                 commission=commission,
-                timestamp=datetime.fromtimestamp(exchange_order.get("timestamp", time.time() * 1000) / 1000, tz=timezone.utc),
+                timestamp=datetime.fromtimestamp(float(exchange_order.get("timestamp", 0) or time.time() * 1000) / 1000, tz=timezone.utc),
             )
 
             # Update order status
@@ -416,7 +486,26 @@ class RealBroker:
             binance_symbol = symbol.replace("/", "").replace(":USDT", "") if symbol else ""
 
             # Fetch order from exchange
-            exchange_order = self.exchange.fetch_order(exchange_order_id, binance_symbol)
+            exchange_order = None
+            if self.testnet and self.market_type == "future":
+                try:
+                    raw_order = self.exchange.fapiPrivateGetOrder({
+                        'symbol': binance_symbol,
+                        'orderId': exchange_order_id
+                    })
+                    # Convert to ccxt structure
+                    exchange_order = {
+                        "id": str(raw_order["orderId"]),
+                        "status": raw_order["status"].lower(),
+                        "filled": float(raw_order.get("executedQty", 0)),
+                        "price": float(raw_order.get("avgPrice", 0)),
+                        "timestamp": int(raw_order.get("updateTime", 0)),
+                    }
+                except Exception as e:
+                     print(f"⚠️ [REAL] Raw Sync Failed: {e}")
+                     return
+            else:
+                exchange_order = self.exchange.fetch_order(exchange_order_id, binance_symbol)
             status = exchange_order.get("status")
 
             # Handle order status outside lock to avoid deadlock
@@ -480,7 +569,7 @@ class RealBroker:
         if not open_order_ids:
             return
 
-        print(f"🔄 [REAL] 同步 {len(open_order_ids)} 个未结订单...")
+        # Sync silently (no print per cycle)
         for exchange_order_id in open_order_ids:
             self._sync_single_order(exchange_order_id)
 
@@ -540,7 +629,14 @@ class RealBroker:
             binance_symbol = order.symbol.replace("/", "").replace(":USDT", "")
 
             # Cancel order on exchange
-            self.exchange.cancel_order(order_id, binance_symbol)
+            # Cancel order on exchange
+            if self.testnet and self.market_type == "future":
+                self.exchange.fapiPrivateDeleteOrder({
+                    'symbol': binance_symbol,
+                    'orderId': order_id
+                })
+            else:
+                self.exchange.cancel_order(order_id, binance_symbol)
 
             with self._lock:
                 order.status = OrderStatus.CANCELLED
@@ -579,6 +675,27 @@ class RealBroker:
         """
         try:
             balance = Decimal("0")
+            
+            # Special handling for Futures Testnet via raw API
+            if self.testnet and self.market_type == "future":
+                try:
+                    raw_balances = self.exchange.fapiPrivateV2GetBalance()
+                    # raw_balances is a list of dicts: [{'asset': 'USDT', 'balance': '...', ...}, ...]
+                    usdt_bal = next((b for b in raw_balances if b['asset'] == 'USDT'), None)
+                    if usdt_bal:
+                        # balance = wallet balance + unrealized pnl
+                        # availableBalance often includes pnl math.
+                        # Let's use balance (wallet) + crossUnPnl (if available) or similar.
+                        # Actually 'balance' in this endpoint is Wallet Balance.
+                        # We also need Unrealized PnL.
+                        wallet_balance = Decimal(str(usdt_bal.get('balance', 0)))
+                        cross_un_pnl = Decimal(str(usdt_bal.get('crossUnPnl', 0)))
+                        balance = wallet_balance + cross_un_pnl
+                        return balance
+                except Exception as e:
+                    print(f"⚠️ [REAL] Raw Balance Fetch Failed: {e}")
+                    # Fallback to standard fetch_balance just in case
+            
             account_info = self.exchange.fetch_balance()
 
             # Get USDT balance
@@ -614,6 +731,19 @@ class RealBroker:
         
         # If not in cache, fetch from exchange
         try:
+            # Special handling for Futures Testnet
+            if self.testnet and self.market_type == "future":
+                binance_symbol = symbol.replace("/", "").replace(":USDT", "")
+                try:
+                    ticker = self.exchange.fapiPublicGetTickerPrice({'symbol': binance_symbol})
+                    if ticker and ticker.get("price"):
+                        price = Decimal(str(ticker["price"]))
+                        with self._lock:
+                            self.market_prices[symbol] = price
+                        return price
+                except Exception as e:
+                    print(f"⚠️ [REAL] Raw Ticker Fetch Failed: {e}")
+
             ticker = self.exchange.fetch_ticker(symbol)
             if ticker and ticker.get("last"):
                 price = Decimal(str(ticker["last"]))
@@ -666,6 +796,94 @@ class RealBroker:
                 "open_orders": 0,
                 "return_pct": Decimal("0"),
             }
+
+    def set_leverage(self, symbol: str, leverage: int) -> bool:
+        """Set leverage for symbol.
+
+        Args:
+            symbol: Trading pair symbol
+            leverage: Leverage value (1-125)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Convert symbol format
+            binance_symbol = symbol.replace("/", "").replace(":USDT", "")
+
+            # Special handling for Futures Testnet
+            if self.testnet and self.market_type == "future":
+                try:
+                    self.exchange.fapiPrivatePostLeverage({
+                        'symbol': binance_symbol,
+                        'leverage': leverage
+                    })
+                    print(f"✅ [REAL] Leverage set to {leverage}x for {symbol}")
+                    return True
+                except Exception as e:
+                    print(f"❌ [REAL] Raw Set Leverage Failed: {e}")
+                    return False
+            
+            # Use CCXT for others
+            self.exchange.set_leverage(leverage, binance_symbol)
+            print(f"✅ [REAL] Leverage set to {leverage}x for {symbol}")
+            return True
+        except Exception as e:
+            print(f"⚠️ [REAL] Failed to set leverage: {e}")
+            return False
+
+    def get_open_orders(self, symbol: str) -> list:
+        """获取指定交易对的未结订单。
+
+        Args:
+            symbol: Trading pair symbol
+
+        Returns:
+            List of open Order objects
+        """
+        return [
+            order for order in self.orders.values()
+            if order.symbol == symbol and order.is_open
+        ]
+
+    def cancel_all_orders(self, symbol: str) -> None:
+        """取消指定交易对的所有未结订单。
+
+        Args:
+            symbol: Trading pair symbol
+        """
+        # Collect exchange_order_ids (keys in self.orders) for open orders matching symbol
+        with self._lock:
+            orders_to_cancel = [
+                (exchange_id, order) 
+                for exchange_id, order in self.orders.items()
+                if order.symbol == symbol and order.is_open
+            ]
+
+        if not orders_to_cancel:
+            print(f"📝 [REAL] 没有需要取消的订单 ({symbol})")
+            return
+
+        print(f"🗑️ [REAL] 取消 {len(orders_to_cancel)} 个订单 ({symbol})...")
+        
+        # Also try bulk cancel via exchange API as backup
+        binance_symbol = symbol.replace("/", "").replace(":USDT", "")
+        try:
+            if self.testnet and self.market_type == "future":
+                self.exchange.fapiPrivateDeleteAllOpenOrders({
+                    'symbol': binance_symbol,
+                })
+                print(f"✅ [REAL] 交易所批量取消成功")
+            else:
+                self.exchange.cancel_all_orders(binance_symbol)
+                print(f"✅ [REAL] 交易所批量取消成功")
+        except Exception as e:
+            print(f"⚠️ [REAL] 批量取消失败，逐个取消: {e}")
+
+        # Update local order status
+        with self._lock:
+            for exchange_id, order in orders_to_cancel:
+                order.status = OrderStatus.CANCELLED
 
     def _try_restore_state(self) -> None:
         """Try to restore state from persistence."""

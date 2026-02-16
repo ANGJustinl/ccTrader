@@ -29,7 +29,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
 from src.trader.application.strategies.crypto_classic import (
     RSIBollingerStrategy,
 )
+from src.trader.application.strategies.crypto_classic import (
+    RSIBollingerStrategy,
+)
 from src.trader.application.strategies.dramm import DRAMMStrategy
+from src.trader.application.strategies.grid import DynamicGridStrategy
 from src.trader.application.risk_manager import RiskManager
 from src.trader.application.backtest_engine import BacktestEngine
 from src.trader.application.backtest_report import BacktestReportGenerator
@@ -113,30 +117,42 @@ def run_live_trading(
     sync_interval: int = 5,
     initial_balance: int = 10000,
     strategy_name: str = "rsi_bollinger",
+    market_type: str = "spot",
+    leverage: int = 1,
+    capital_usage: int = 50,
+    silent: bool = False,
 ) -> None:
     """
     Run live trading with live market data and order sync on Binance Testnet.
 
     Args:
         symbol: Trading symbol (default: BTC/USDT perpetual)
-        duration_seconds: How long to run (default: 300 seconds / 5 minutes)
+        duration_seconds: How long to run (default: 300 seconds / 5 minutes). 0 for infinite.
         sync_interval: Order sync interval in seconds (default: 5)
         initial_balance: Initial balance for risk manager (default: 10000)
         strategy_name: Strategy to use ("rsi_bollinger" or "dramm")
+        market_type: Market type ("spot" or "future")
+        leverage: Leverage value (default: 1)
+        silent: Silent mode (suppress TUI, run indefinitely by default)
     """
     # Initialize components
     event_bus = EventBus()
     clock = RealtimeClock()
     data_downloader = DataDownloader(exchange_name="binance", env_file=".env.dev")
     
+    # Configure DataDownloader for futures if needed
+    if market_type == "future":
+        data_downloader.exchange.options['defaultType'] = 'future'
+    
     # Initialize risk manager
     risk_manager = RiskManager(
         initial_balance=Decimal(str(initial_balance)),
         max_drawdown_pct=Decimal("0.05"),
         daily_loss_limit_pct=Decimal("0.10"),
-        max_order_size=Decimal("1.0"),
+        max_order_size=Decimal("100.0"),  # ETH max per order
         max_position_pct=Decimal("0.5"),
     )
+    risk_manager._leverage = leverage  # Pass leverage for margin-based position checks
     
     # Initialize state persistence
     state_persistence = StatePersistence()
@@ -148,6 +164,7 @@ def run_live_trading(
         testnet=True,
         risk_manager=risk_manager,
         state_persistence=state_persistence,
+        market_type=market_type,
     )
 
     # Create strategy based on strategy_name parameter
@@ -164,6 +181,20 @@ def run_live_trading(
             atr_multiplier=Decimal("3"),
             entry_score_threshold=Decimal("0.8"),
             exit_score_threshold=Decimal("-0.6"),
+        )
+    elif strategy_name.lower() == "grid":
+        print("\n[SETUP] Using Dynamic Grid Strategy (Optimized)")
+        strategy = DynamicGridStrategy(
+             symbol=symbol,
+             grid_number=10, 
+             atr_multiplier=20.0,
+             min_profit_per_grid=0.003,
+             stop_loss_buffer=0.005,
+             position_size=0.01, # Fallback only, dynamic calc overrides this
+             trend_filter_enabled=True,
+             grid_spacing="geometric",
+             leverage=leverage,
+             capital_usage=capital_usage / 100,  # Convert percentage to fraction
         )
     else:
         print("\n[SETUP] Using RSI Bollinger Strategy")
@@ -184,11 +215,11 @@ def run_live_trading(
     strategy.event_bus = event_bus
 
     # Signal handler for graceful shutdown
+    running = True
     def signal_handler(signum, frame):
+        nonlocal running
         print("\n\n🛑 Received shutdown signal...")
-        broker.stop_order_sync()
-        print("✅ Order sync stopped. Exiting...")
-        sys.exit(0)
+        running = False
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -200,6 +231,11 @@ def run_live_trading(
     summary = broker.get_account_summary()
     print("Connected successfully!")
     print_account_summary(broker)
+
+    # Set leverage if futures
+    if market_type == "future":
+        print(f"\nSetting leverage to {leverage}x...")
+        broker.set_leverage(symbol, leverage)
 
     # Preload initial historical data for indicators
     print("\nPreloading initial historical data...")
@@ -218,6 +254,15 @@ def run_live_trading(
         
         strategy.trading_enabled = True
         print("   Trading enabled for live trading")
+        
+        # Reset grid state after preload so live trading can initialize fresh grids
+        if hasattr(strategy, 'grid_lines'):
+            strategy.grid_lines = []
+            strategy.grid_orders = {}
+            strategy.upper_limit = None
+            strategy.lower_limit = None
+            strategy.pivot_price = None
+            print("   Grid state reset for live trading (preload complete)")
     except Exception as e:
         print(f"Warning: Could not preload historical data: {e}")
         strategy.trading_enabled = True
@@ -227,8 +272,11 @@ def run_live_trading(
     broker.start_order_sync(interval=sync_interval)
 
     # Main loop
-    print("\nStarting live trading loop...")
-    print(f"   Duration: {duration_seconds} seconds")
+    print(f"\nStarting live trading loop... (Silent: {silent})")
+    if duration_seconds > 0:
+        print(f"   Duration: {duration_seconds} seconds")
+    else:
+        print(f"   Duration: Infinite")
     print(f"   Press Ctrl+C to stop early")
     print("-" * 80)
 
@@ -238,11 +286,16 @@ def run_live_trading(
     latest_bar = None
 
     try:
-        while time.time() - start_time < duration_seconds:
+        while running:
+            # Check duration
+            if duration_seconds > 0 and (time.time() - start_time >= duration_seconds):
+                 break
+            
             iteration += 1
 
-            clear_screen()
-            print_header(symbol, strategy.name, mode="LIVE")
+            if not silent:
+                clear_screen()
+                print_header(symbol, strategy.name, mode="LIVE")
 
             try:
                 ticker = data_downloader.fetch_ticker(symbol)
@@ -265,24 +318,37 @@ def run_live_trading(
                         latest_bar = ohlcv_recent[-1]
                         if last_bar_time != latest_bar.timestamp:
                             last_bar_time = latest_bar.timestamp
-                            print(f"\nNew bar received: {latest_bar.timestamp}")
-                            strategy.on_bar(latest_bar)
+                            if not silent:
+                                print(f"\nNew bar received: {latest_bar.timestamp}")
+                            else:
+                                print(f"[{datetime.now().strftime('%H:%M:%S')}] New Bar: {latest_bar.timestamp} | Price: {latest_bar.close}")
+                            try:
+                                strategy.on_bar(latest_bar)
+                            except Exception as bar_err:
+                                print(f"❌ [STRATEGY] on_bar error: {bar_err}")
+                                import traceback; traceback.print_exc()
                 except Exception as e:
                     pass
 
-                print_account_summary(broker)
-                print_market_data(
-                    current_price=current_price,
-                    bid=bid,
-                    ask=ask,
-                    last_bar=latest_bar,
-                )
-                print_positions(broker, symbol)
+                if not silent:
+                    print_account_summary(broker)
+                    print_market_data(
+                        current_price=current_price,
+                        bid=bid,
+                        ask=ask,
+                        last_bar=latest_bar,
+                    )
+                    print_positions(broker, symbol)
 
-                print(f"\nIteration: {iteration} | Elapsed: {int(time.time() - start_time)}s / {duration_seconds}s")
-                print(f"Order Sync: RUNNING (interval: {sync_interval}s)")
+                    print(f"\nIteration: {iteration} | Elapsed: {int(time.time() - start_time)}s / {duration_seconds}s")
+                    print(f"Order Sync: RUNNING (interval: {sync_interval}s)")
+                else:
+                    # Silent heartbeat
+                    elapsed = int(time.time() - start_time)
+                    print(f"\r[{datetime.now().strftime('%H:%M:%S')}] Iter: {iteration} | Price: {current_price} | Positions: {len(broker.positions)} | Balance: {broker.get_balance():.2f} | Elapsed: {elapsed}s", end="")
 
-                if iteration % 10 == 0:
+                save_interval = 100 if silent else 10
+                if iteration % save_interval == 0:
                     broker._save_state_periodically()
 
             except Exception as e:
@@ -295,7 +361,15 @@ def run_live_trading(
     except KeyboardInterrupt:
         print("\n\nStopped by user")
     finally:
-        print("\nStopping order synchronization...")
+        # Cancel all open orders before exiting
+        print("\n📤 Cancelling all open orders...")
+        try:
+            broker.cancel_all_orders(symbol)
+            print("✅ All open orders cancelled")
+        except Exception as e:
+            print(f"⚠️ Failed to cancel orders: {e}")
+
+        print("Stopping order synchronization...")
         broker.stop_order_sync()
         print("\nSaving final state...")
         broker._save_state_periodically()
@@ -437,7 +511,7 @@ if __name__ == "__main__":
         "--strategy",
         type=str,
         default="rsi_bollinger",
-        choices=["rsi_bollinger", "dramm"],
+        choices=["rsi_bollinger", "dramm", "grid"],
         help="Strategy to use (default: rsi_bollinger, options: rsi_bollinger, dramm)",
     )
 
@@ -512,6 +586,32 @@ if __name__ == "__main__":
         help="K-line timeframe for backtest (default: 1m)",
     )
 
+    parser.add_argument(
+        "--futures",
+        action="store_true",
+        help="Use futures market (default: spot)",
+    )
+
+    parser.add_argument(
+        "--leverage",
+        type=int,
+        default=20,
+        help="Leverage for futures (default: 20)",
+    )
+
+    parser.add_argument(
+        "--capital-usage",
+        type=int,
+        default=50,
+        help="Capital usage percentage for grid strategy (default: 50)",
+    )
+
+    parser.add_argument(
+        "--silent",
+        action="store_true",
+        help="Silent mode (suppress TUI, run indefinitely by default)",
+    )
+
     args = parser.parse_args()
 
     if args.backtest:
@@ -530,11 +630,29 @@ if __name__ == "__main__":
     else:
         # Live trading mode
         # For live trading, use perpetual symbol if not specified
-        live_symbol = args.symbol if ":USDT" in args.symbol else f"{args.symbol}:USDT"
+        live_symbol = args.symbol
+        market_type = "spot"
+        
+        if args.futures:
+            market_type = "future"
+            if ":USDT" not in args.symbol and "/" in args.symbol:
+                 live_symbol = f"{args.symbol}:USDT"
+        
+        # Handle duration default
+        duration = args.duration
+        if args.silent and duration == 300:
+             # If silent is on and duration is default, set to 0 (infinite)
+             # Assumption: user didn't explicitly set --duration 300 if they wanted silent infinite
+             duration = 0
+
         run_live_trading(
             symbol=live_symbol,
-            duration_seconds=args.duration,
+            duration_seconds=duration,
             sync_interval=args.sync_interval,
             initial_balance=args.initial_balance,
             strategy_name=args.strategy,
+            market_type=market_type,
+            leverage=args.leverage,
+            capital_usage=args.capital_usage,
+            silent=args.silent,
         )

@@ -17,7 +17,7 @@ from ..infrastructure.data_repository import (
 from ..utils.slippage import VolatilitySlippageModel, BarDataForSlippage
 from .simulated_broker import SimulatedBroker
 from .order import Order
-from .backtest_report import BacktestReportGenerator
+from .backtest_report import BacktestReportGenerator, TradeRecord
 
 
 class BacktestEngine:
@@ -83,6 +83,7 @@ class BacktestEngine:
 
         # 性能指标
         self.trades: List[dict] = []
+        self.completed_trades: List[TradeRecord] = []
         self.equity_curve: List[dict] = []
         
         # 累计统计
@@ -242,6 +243,24 @@ class BacktestEngine:
         self.event_bus.subscribe(EventType.ORDER_SUBMITTED, on_order_event)
         self.event_bus.subscribe(EventType.ORDER_FILLED, on_order_event)
         self.event_bus.subscribe(EventType.ORDER_CANCELLED, on_order_event)
+
+        # 订阅交易完成事件
+        def on_trade_completed(event: Event):
+            data = event.data
+            self.completed_trades.append(
+                TradeRecord(
+                    entry_timestamp=event.timestamp, # Simplified: use exit time for both
+                    exit_timestamp=event.timestamp,
+                    side=data["side"],
+                    entry_price=Decimal(data["entry_price"]),
+                    exit_price=Decimal(data["exit_price"]),
+                    quantity=Decimal(data["quantity"]),
+                    pnl=Decimal(data["pnl"]),
+                    pnl_percent=Decimal(data["pnl"]) / (Decimal(data["entry_price"]) * Decimal(data["quantity"])) * 100 if Decimal(data["quantity"]) > 0 else Decimal(0),
+                    commission=Decimal(data["commission"]),
+                )
+            )
+        self.event_bus.subscribe(EventType.TRADE_COMPLETED, on_trade_completed)
 
     def _process_bar(self, bar: BarData) -> None:
         """处理单根 K 线
@@ -439,7 +458,7 @@ class BacktestEngine:
             initial_balance=initial_balance,
             final_balance=final_balance,
             equity_curve=self.equity_curve,
-            trades=[],  # TODO: Convert self.trades to TradeRecord format
+            trades=self.completed_trades,
             total_commission=self.total_commission,
             total_slippage=self.total_slippage,
             total_funding_paid=self.total_funding_paid,

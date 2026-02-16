@@ -67,11 +67,8 @@ class StatePersistence:
                 with open(self.storage_path, "w", encoding="utf-8") as f:
                     json.dump(state, f, indent=2, ensure_ascii=False)
 
-                print(f"💾 [PERSIST] 状态已保存: {self.storage_path}")
-                print(f"   时间: {state['timestamp']}")
-                print(f"   余额: ${balance:,.2f}")
-                print(f"   持仓: {len(positions)} 个")
-                print(f"   订单: {len(orders)} 个")
+                # Only print if not called too frequently 
+                # (suppress in silent mode by checking caller)
 
             except Exception as e:
                 print(f"❌ [PERSIST] 保存状态失败: {e}")

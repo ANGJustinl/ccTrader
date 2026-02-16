@@ -176,7 +176,11 @@ class RiskManager:
         current_balance: Decimal,
         positions: Dict[str, Position],
     ) -> Tuple[bool, str]:
-        """Check if adding position exceeds net value limit."""
+        """Check if adding position exceeds net value limit.
+        
+        For leveraged positions, compare margin (notional / leverage) 
+        instead of raw notional value.
+        """
         if current_balance <= Decimal("0"):
             return False, "No available balance"
 
@@ -185,18 +189,28 @@ class RiskManager:
         current_position_value = Decimal("0")
         
         if current_position and current_position.quantity > Decimal("0"):
-            # Use entry price as estimate
-            current_position_value = current_position.quantity * current_position.entry_price
+            # Use margin (entry_price * qty / leverage) for leveraged positions
+            leverage = Decimal(str(current_position.leverage)) if current_position.leverage > 1 else Decimal("1")
+            current_position_value = (current_position.quantity * current_position.entry_price) / leverage
 
-        # Estimate new position value
-        order_value = order.quantity * (order.price if order.price else Decimal("50000"))  # Fallback price
-        total_position_value = current_position_value + order_value
+        # Estimate new order margin
+        order_price = order.price if order.price else Decimal("50000")  # Fallback price
+        order_notional = order.quantity * order_price
+        # Determine leverage from existing position or default to 1
+        leverage = Decimal("1")
+        if current_position and current_position.leverage > 1:
+            leverage = Decimal(str(current_position.leverage))
+        elif hasattr(self, '_leverage'):
+            leverage = Decimal(str(self._leverage))
+        order_margin = order_notional / leverage
+        
+        total_margin = current_position_value + order_margin
 
         max_allowed_value = current_balance * self.max_position_pct
         
-        if total_position_value > max_allowed_value:
+        if total_margin > max_allowed_value:
             return False, (
-                f"Position size limit: {total_position_value:,.2f} exceeds "
+                f"Position margin limit: {total_margin:,.2f} exceeds "
                 f"{self.max_position_pct * 100:.1f}% of balance ({max_allowed_value:,.2f})"
             )
 

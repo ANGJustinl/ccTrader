@@ -18,6 +18,7 @@ class EventType(StrEnum):
     ORDER_CANCELLED = "order_cancelled"
     POSITION_OPENED = "position_opened"
     POSITION_CLOSED = "position_closed"
+    TRADE_COMPLETED = "trade_completed"
     FUNDING_RATE_APPLIED = "funding_rate_applied"
     ERROR = "error"
 

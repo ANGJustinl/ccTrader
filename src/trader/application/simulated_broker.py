@@ -248,6 +248,23 @@ class SimulatedBroker:
                 # 更新余额
                 self.balance += realized_pnl - fill.commission
 
+                # 发布交易完成事件 (用于回测统计)
+                self.event_bus.publish(
+                    Event(
+                        type=EventType.TRADE_COMPLETED,
+                        timestamp=self.clock.now(),
+                        data={
+                            "symbol": symbol,
+                            "side": current_side.value,
+                            "entry_price": str(position.entry_price), # Note: this is avg entry price
+                            "exit_price": str(fill.price),
+                            "quantity": str(fill.quantity),
+                            "pnl": str(realized_pnl),
+                            "commission": str(fill.commission),
+                        },
+                    )
+                )
+
                 if position.is_closed:
                     # 发布平仓事件
                     self.event_bus.publish(
@@ -291,6 +308,18 @@ class SimulatedBroker:
         )
 
         return True
+
+    def get_open_orders(self, symbol: str) -> List[Order]:
+        """获取未结订单
+        
+        Args:
+            symbol: Trading pair symbol
+            
+        Returns:
+            List of open orders
+        """
+        order_ids = self.open_orders.get(symbol, [])
+        return [self.orders[oid] for oid in order_ids if oid in self.orders]
 
     def get_position(self, symbol: str) -> Optional[Position]:
         """获取当前仓位
