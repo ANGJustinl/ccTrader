@@ -18,6 +18,7 @@ Usage:
 import os
 import sys
 import time
+import math
 import signal
 from datetime import datetime
 from decimal import Decimal
@@ -43,6 +44,7 @@ from src.trader.infrastructure.real_broker import RealBroker
 from src.trader.infrastructure.state_persistence import StatePersistence
 from src.trader.infrastructure.clock import RealtimeClock
 from src.trader.infrastructure.data_repository import BarData
+from src.trader.infrastructure.live_trading_stats import LiveTradingStats
 
 
 def clear_screen() -> None:
@@ -120,6 +122,7 @@ def run_live_trading(
     market_type: str = "spot",
     leverage: int = 1,
     capital_usage: int = 50,
+    timeframe: str = "15m",
     silent: bool = False,
 ) -> None:
     """
@@ -133,6 +136,7 @@ def run_live_trading(
         strategy_name: Strategy to use ("rsi_bollinger" or "dramm")
         market_type: Market type ("spot" or "future")
         leverage: Leverage value (default: 1)
+        timeframe: K-line timeframe (default: 15m)
         silent: Silent mode (suppress TUI, run indefinitely by default)
     """
     # Initialize components
@@ -144,11 +148,22 @@ def run_live_trading(
     if market_type == "future":
         data_downloader.exchange.options['defaultType'] = 'future'
     
+    # Auto-scale risk limits based on leverage
+    # Higher leverage = larger P&L swings, need wider drawdown tolerance
+    # Formula: min(3% * leverage + 2%, 30%)
+    #   1x  → 5%     5x  → 17%    10x → 30%    20x → 30% (capped)
+    auto_max_drawdown = min(Decimal("0.03") * leverage + Decimal("0.02"), Decimal("0.30"))
+    auto_daily_loss = min(auto_max_drawdown * 2, Decimal("0.50"))
+    
+    print(f"📐 [RISK] Auto-scaled limits for {leverage}x leverage:")
+    print(f"   Max drawdown: {auto_max_drawdown * 100:.0f}%")
+    print(f"   Daily loss limit: {auto_daily_loss * 100:.0f}%")
+    
     # Initialize risk manager
     risk_manager = RiskManager(
         initial_balance=Decimal(str(initial_balance)),
-        max_drawdown_pct=Decimal("0.05"),
-        daily_loss_limit_pct=Decimal("0.10"),
+        max_drawdown_pct=auto_max_drawdown,
+        daily_loss_limit_pct=auto_daily_loss,
         max_order_size=Decimal("1000000000.0"),  # Effectively unlimited quantity, relying on value limits
         max_position_pct=Decimal("0.5"),
     )
@@ -214,20 +229,30 @@ def run_live_trading(
     strategy.clock = clock
     strategy.event_bus = event_bus
 
+    # Initialize live trading stats collector
+    stats = LiveTradingStats(
+        initial_balance=Decimal(str(initial_balance)),
+        symbol=symbol,
+        leverage=leverage,
+    )
+
     # Wired up event listeners
     def on_order_filled(event):
         try:
-            # Convert event data back to Order object or pass data dict
-            # Strategy expects Order object usually, let's check grid.py
-            # grid.py on_order_update expects Order object.
-            # But event data is a dict. We need to fetch the Order from broker.
-            order_id = event.data.get("order_id")
-            if order_id:
-                order = broker.orders.get(order_id)
+            # RealBroker stores orders keyed by exchange_order_id, not internal UUID
+            exchange_id = event.data.get("exchange_id")
+            if exchange_id:
+                order = broker.orders.get(exchange_id)
                 if order:
                     strategy.on_order_update(order)
+                else:
+                    print(f"⚠️ [MAIN] Order not found for exchange_id={exchange_id}")
+            # Record fill in stats collector
+            stats.on_fill(event.data)
         except Exception as e:
             print(f"❌ [MAIN] Error processing order fill: {e}")
+            import traceback
+            traceback.print_exc()
 
     event_bus.subscribe(EventType.ORDER_FILLED, on_order_filled)
 
@@ -262,7 +287,7 @@ def run_live_trading(
         
         ohlcv_data = data_downloader.download_ohlcv(
             symbol=symbol,
-            timeframe="1m",
+            timeframe=timeframe,
             limit=200,
         )
         for bar in ohlcv_data:
@@ -328,7 +353,7 @@ def run_live_trading(
                 try:
                     ohlcv_recent = data_downloader.download_ohlcv(
                         symbol=symbol,
-                        timeframe="1m",
+                        timeframe=timeframe,
                         limit=2,
                     )
                     if ohlcv_recent:
@@ -368,6 +393,19 @@ def run_live_trading(
                 if iteration % save_interval == 0:
                     broker._save_state_periodically()
 
+                # Record equity snapshot for Sharpe/drawdown (every ~20s)
+                if iteration % 10 == 0:
+                    try:
+                        equity = broker.get_balance()
+                        # Add unrealized P&L
+                        for sym, pos in broker.positions.items():
+                            mp = broker.market_prices.get(sym)
+                            if mp:
+                                equity += pos.calculate_unrealized_pnl(mp)
+                        stats.record_equity(equity)
+                    except Exception:
+                        pass
+
             except Exception as e:
                 print(f"\nError: {e}")
                 import traceback
@@ -391,11 +429,24 @@ def run_live_trading(
         print("\nSaving final state...")
         broker._save_state_periodically()
 
+    # Compute final equity
+    final_balance = broker.get_balance()
+    final_equity = final_balance
+    for sym, pos in broker.positions.items():
+        mp = broker.market_prices.get(sym)
+        if mp:
+            final_equity += pos.calculate_unrealized_pnl(mp)
+
     print("\n" + "=" * 80)
     print("TRADING SESSION COMPLETE")
     print("=" * 80)
     print_account_summary(broker)
     print_positions(broker, symbol)
+
+    # Print and save performance statistics
+    stats.print_summary(final_balance, final_equity)
+    results_path = stats.save_to_file(final_balance, final_equity)
+    print(f"\n💾 Results saved to: {results_path}")
 
 
 def run_backtest(
@@ -510,6 +561,307 @@ def run_backtest(
     print("=" * 80)
 
 
+def run_dry_run(
+    symbol: str = "BTC/USDT",
+    strategy_name: str = "grid",
+    leverage: int = 20,
+    capital_usage: int = 50,
+    initial_balance: int = 0,
+    timeframe: str = "15m",
+) -> None:
+    """
+    Dry-run mode: estimate minimum USDT and optimal position sizing.
+    
+    Connects to Binance PUBLIC API only (no API key needed for market data).
+    Does NOT place any orders.
+    
+    Args:
+        symbol: Trading pair (e.g. BTC/USDT)
+        strategy_name: Strategy name (grid recommended)
+        leverage: Leverage multiplier
+        capital_usage: Capital usage percentage (0-100)
+        initial_balance: Override balance for estimation (0 = fetch from exchange)
+        timeframe: K-line timeframe (default: 15m)
+    """
+    from src.trader.utils.indicators import calculate_atr, calculate_bollinger_bands
+    
+    print("=" * 62)
+    print("  DRY-RUN CAPITAL ESTIMATION (No orders will be placed)")
+    print("=" * 62)
+    
+    # --- 1. Initialize exchange (public API only) ---
+    data_downloader = DataDownloader(exchange_name="binance", env_file=".env.dev", testnet=False)
+    exchange = data_downloader.exchange
+    
+    # Determine symbols
+    futures_symbol = f"{symbol}:USDT" if ":USDT" not in symbol else symbol
+    binance_raw = symbol.replace("/", "").replace(":USDT", "")
+    
+    # --- 2. Load market info ---
+    print(f"\n📡 Fetching exchange info for {futures_symbol}...")
+    try:
+        exchange.options['defaultType'] = 'future'
+        exchange.load_markets(True)  # Force reload
+    except Exception as e:
+        print(f"⚠️ Failed to load markets with future type: {e}")
+        print("   Trying spot markets...")
+        exchange.options['defaultType'] = 'spot'
+        exchange.load_markets(True)
+    
+    # Find market
+    market = exchange.market(futures_symbol) if futures_symbol in exchange.markets else None
+    if not market:
+        # Fallback: try spot
+        market = exchange.market(symbol) if symbol in exchange.markets else None
+    
+    if not market:
+        print(f"❌ Symbol {futures_symbol} not found on exchange.")
+        print(f"   Available similar: {[s for s in exchange.markets if binance_raw[:3] in s][:5]}")
+        return
+    
+    # Parse exchange limits
+    limits = market.get('limits', {})
+    precision = market.get('precision', {})
+    info = market.get('info', {})
+    
+    min_notional = Decimal("5")  # Default
+    min_qty = Decimal("0.001")
+    step_size = Decimal("0.001")
+    tick_size = Decimal("0.01")
+    
+    # Parse from filters (Binance specific)
+    filters = info.get('filters', []) if isinstance(info, dict) else []
+    for f in filters:
+        ft = f.get('filterType', '')
+        if ft == 'MIN_NOTIONAL':
+            min_notional = Decimal(str(f.get('notional', f.get('minNotional', '5'))))
+        elif ft == 'LOT_SIZE':
+            min_qty = Decimal(str(f.get('minQty', '0.001')))
+            step_size = Decimal(str(f.get('stepSize', '0.001')))
+        elif ft == 'PRICE_FILTER':
+            tick_size = Decimal(str(f.get('tickSize', '0.01')))
+    
+    # Also try CCXT parsed limits
+    if limits.get('amount', {}).get('min'):
+        min_qty = max(min_qty, Decimal(str(limits['amount']['min'])))
+    if limits.get('cost', {}).get('min'):
+        min_notional = max(min_notional, Decimal(str(limits['cost']['min'])))
+    
+    # --- 3. Get current price ---
+    print(f"📊 Fetching current price...")
+    try:
+        ticker = exchange.fetch_ticker(futures_symbol)
+        current_price = Decimal(str(ticker['last']))
+    except:
+        ticker = exchange.fetch_ticker(symbol)
+        current_price = Decimal(str(ticker['last']))
+    
+    # --- 4. Get historical bars for ATR/BB ---
+    print(f"📈 Downloading 200 bars of {timeframe} data for indicators...")
+    try:
+        bars = data_downloader.download_ohlcv(
+            symbol=futures_symbol,
+            timeframe=timeframe,
+            limit=200,
+        )
+    except Exception as e:
+        print(f"   (Failed to download {futures_symbol} data: {e}. Trying spot symbol {symbol} with {timeframe}.)")
+        bars = data_downloader.download_ohlcv(symbol=symbol, timeframe=timeframe, limit=200)
+    
+    if len(bars) < 30:
+        print(f"⚠️ Only {len(bars)} bars available. Need at least 30 for reliable estimation.")
+        return
+    
+    closes = [b.close for b in bars]
+    highs = [b.high for b in bars]
+    lows = [b.low for b in bars]
+    
+    atr_values = calculate_atr(highs, lows, closes, period=14)
+    bb_values = calculate_bollinger_bands(closes, period=20, std_dev=Decimal("2.0"))
+    
+    atr = atr_values[-1] if atr_values and atr_values[-1] else current_price * Decimal("0.01")
+    pivot = bb_values[-1].middle if bb_values and bb_values[-1].middle else current_price
+    
+    # --- 5. Grid strategy simulation ---
+    atr_multiplier = Decimal("4.0")
+    grid_number = 20
+    min_profit_per_grid = Decimal("0.0005")
+    capital_usage_frac = Decimal(str(capital_usage)) / Decimal("100")
+    
+    range_width = atr * atr_multiplier
+    upper_limit = pivot + range_width
+    lower_limit = pivot - range_width
+    
+    if abs(current_price - pivot) > (range_width * Decimal("0.5")):
+        pivot = current_price
+        upper_limit = pivot + range_width
+        lower_limit = pivot - range_width
+    
+    # Geometric grid count
+    min_ratio = Decimal("1") + min_profit_per_grid
+    try:
+        max_grids = int(math.log(float(upper_limit / lower_limit)) / math.log(float(min_ratio)))
+    except (ValueError, ZeroDivisionError):
+        max_grids = grid_number
+    
+    actual_grids = min(grid_number, max_grids)
+    if actual_grids < 3:
+        actual_grids = 3
+    
+    # Geometric ratio
+    ratio = (upper_limit / lower_limit) ** (Decimal("1") / Decimal(str(actual_grids)))
+    grid_spacing_pct = (ratio - Decimal("1")) * Decimal("100")
+    
+    # --- 6. Capital calculations ---
+    # Min qty value in USDT
+    min_qty_value = min_qty * current_price
+    
+    # Min USDT for 1 grid order (must satisfy both min_notional and min_qty * price)
+    min_usdt_1_grid = max(min_notional, min_qty_value)
+    
+    # Min USDT for all grids (bare minimum)
+    min_usdt_all_grids_no_lev = min_usdt_1_grid * actual_grids
+    
+    # With leverage, margin needed is notional / leverage
+    min_margin_all_grids = min_usdt_all_grids_no_lev / Decimal(str(leverage))
+    
+    # Optimal sizing (if balance provided)
+    balance = Decimal(str(initial_balance)) if initial_balance > 0 else Decimal("0")
+    
+    # Try to fetch real balance
+    if balance == 0:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(".env.dev")
+            api_key = os.getenv("BINANCE_DEMO_API_KEY") or os.getenv("BINANCE_API_KEY") or ""
+            api_secret = os.getenv("BINANCE_DEMO_API_SECRET") or os.getenv("BINANCE_API_SECRET") or ""
+            if api_key and api_secret:
+                import ccxt
+                priv_exchange = ccxt.binance({
+                    'apiKey': api_key,
+                    'secret': api_secret,
+                    'enableRateLimit': True,
+                    'options': {'defaultType': 'future'},
+                    'urls': {
+                        'api': {
+                            'fapiPublic': 'https://testnet.binancefuture.com/fapi/v1',
+                            'fapiPrivate': 'https://testnet.binancefuture.com/fapi/v1',
+                            'fapiPrivateV2': 'https://testnet.binancefuture.com/fapi/v2',
+                        },
+                    }
+                })
+                raw_balances = priv_exchange.fapiPrivateV2GetBalance()
+                usdt_bal = next((b for b in raw_balances if b['asset'] == 'USDT'), None)
+                if usdt_bal:
+                    balance = Decimal(str(usdt_bal.get('availableBalance', usdt_bal.get('balance', 0))))
+        except Exception as e:
+            print(f"   (Could not fetch balance: {e}. Using --initial-balance or default.)")
+    
+    if balance == 0:
+        balance = Decimal("500")  # Default demo
+        balance_source = "default (set --initial-balance to override)"
+    else:
+        balance_source = "exchange (testnet)"
+    
+    usable_capital = balance * capital_usage_frac * Decimal(str(leverage))
+    qty_per_grid = usable_capital / (Decimal(str(actual_grids)) * current_price)
+    
+    # Round to step size
+    qty_per_grid = (qty_per_grid / step_size).to_integral_value(rounding='ROUND_DOWN') * step_size
+    value_per_grid = qty_per_grid * current_price
+    total_notional = value_per_grid * actual_grids
+    
+    # Fee estimation
+    commission_rate = Decimal("0.0004")  # 0.04% taker
+    fee_per_grid_side = value_per_grid * commission_rate
+    profit_per_grid = value_per_grid * (ratio - Decimal("1"))
+    net_per_grid = profit_per_grid - (fee_per_grid_side * 2)  # buy + sell fees
+    
+    # Check viability
+    viable = qty_per_grid >= min_qty and value_per_grid >= min_notional
+    atr = calculate_atr(highs, lows, closes, period=14)[-1]
+    
+    print(f"\n==============================================================")
+    print(f"  📋 DRY-RUN REPORT: {futures_symbol}")
+    print(f"==============================================================")
+    print(f"")
+    print(f"  Symbol:          {futures_symbol}")
+    print(f"  Timeframe:       {timeframe}")
+    print(f"  Current Price:   ${current_price}")
+    print(f"  Leverage:        {leverage}x")
+    print(f"  Capital Usage:   {capital_usage}%")
+    print(f"  Strategy:        {strategy_name.upper()}")
+    print(f"")
+    print(f"  --- Exchange Limits ---")
+    print(f"  Min Notional:    {min_notional} USDT")
+    print(f"  Min Qty:         {min_qty} ({binance_raw.replace('USDT', '')}) (= ${min_qty * current_price:.4f} @ current price)")
+    print(f"  Lot Step:        {step_size}")
+    print(f"  Price Tick:      {tick_size:.7f}")
+    
+    print(f"")
+    print(f"  --- Grid Strategy Analysis ---")
+    print(f"  ATR (14, {timeframe}):    {atr:.4f}")
+    print(f"  Pivot (BB Mid):  ${pivot:,.2f}")
+    print(f"  Grid Range:      [${lower_limit:,.2f}, ${upper_limit:,.2f}]")
+    print(f"  Range Width:     ${range_width:,.2f} ({range_width/current_price*100:.2f}% of price)")
+    print(f"  Grid Count:      {actual_grids} (max feasible: {max_grids})")
+    print(f"  Grid Spacing:    Geometric (ratio: {ratio:.6f}, ~{grid_spacing_pct:.4f}%)")
+    
+    print(f"\n  --- Minimum Capital Requirements ---")
+    print(f"  Min USDT (1 grid, min qty):         ${min_usdt_1_grid:,.4f}")
+    print(f"  Min USDT (all {actual_grids} grids, no lev):   ${min_usdt_all_grids_no_lev:,.4f}")
+    print(f"  Min Margin ({actual_grids} grids, {leverage}x lev):  ${min_margin_all_grids:,.4f}")
+    
+    print(f"\n  --- Optimal Position Sizing ---")
+    print(f"  Your Balance:    ${balance:,.2f} ({balance_source})")
+    print(f"  Usable Capital:  ${usable_capital:,.2f} (balance × {leverage}x × {capital_usage}%)")
+    print(f"  Qty per Grid:    {qty_per_grid} ({binance_raw[:len(binance_raw)-4] if binance_raw.endswith('USDT') else binance_raw})")
+    print(f"  Value per Grid:  ${value_per_grid:,.4f}")
+    print(f"  Total Notional:  ${total_notional:,.2f}")
+    
+    print(f"\n  --- Fee Estimate ---")
+    print(f"  Commission Rate: {commission_rate*100:.2f}% (taker)")
+    print(f"  Fee per Grid:    ${fee_per_grid_side:,.4f} per side")
+    print(f"  Profit per Grid: ~${profit_per_grid:,.4f} ({grid_spacing_pct:.4f}% spacing)")
+    print(f"  Net per Grid:    ~${net_per_grid:,.4f} (after buy+sell fees)")
+    
+    print(f"\n  --- Viability Check ---")
+    if viable:
+        print(f"  ✅ VIABLE: qty_per_grid ({qty_per_grid}) >= min_qty ({min_qty})")
+        print(f"  ✅ VIABLE: value_per_grid (${value_per_grid:,.4f}) >= min_notional (${min_notional})")
+        if net_per_grid > 0:
+            print(f"  ✅ PROFITABLE: net_per_grid (${net_per_grid:,.4f}) > 0")
+        else:
+            print(f"  ⚠️ WARNING: net_per_grid (${net_per_grid:,.4f}) <= 0. Grid spacing too tight!")
+    else:
+        print(f"  ❌ NOT VIABLE with current balance/settings:")
+        if qty_per_grid < min_qty:
+            needed_balance = (min_qty * current_price * actual_grids) / (capital_usage_frac * Decimal(str(leverage)))
+            print(f"     qty_per_grid ({qty_per_grid}) < min_qty ({min_qty})")
+            print(f"     Minimum balance needed: ${needed_balance:,.2f}")
+        if value_per_grid < min_notional:
+            needed_balance = (min_notional * actual_grids) / (capital_usage_frac * Decimal(str(leverage)))
+            print(f"     value_per_grid (${value_per_grid:,.4f}) < min_notional (${min_notional})")
+            print(f"     Minimum balance needed: ${needed_balance:,.2f}")
+    
+    # Recommendations
+    print(f"\n  --- Recommendations ---")
+    if actual_grids < grid_number:
+        print(f"  💡 Grid count reduced from {grid_number} to {actual_grids} to maintain min profit margin.")
+    if not viable:
+        suggestions = []
+        suggestions.append(f"Increase --initial-balance (try ≥${min_margin_all_grids * 2:,.0f})")
+        suggestions.append(f"Increase --leverage (current: {leverage}x)")
+        suggestions.append(f"Increase --capital-usage (current: {capital_usage}%)")
+        suggestions.append(f"Reduce grid_number (current: {grid_number})")
+        for i, s in enumerate(suggestions, 1):
+            print(f"  {i}. {s}")
+    else:
+        print(f"  ✅ Ready to trade! Run without --dry-run to start live trading.")
+    
+    print("\n" + "=" * 62)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -555,7 +907,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--initial-balance",
         type=int,
-        default=10000,
+        default=5000,
         help="Initial balance for risk manager (default: 10000)",
     )
 
@@ -609,58 +961,68 @@ if __name__ == "__main__":
         help="Use futures market (default: spot)",
     )
 
-    parser.add_argument(
-        "--leverage",
-        type=int,
-        default=20,
-        help="Leverage for futures (default: 20)",
-    )
 
-    parser.add_argument(
-        "--capital-usage",
-        type=int,
-        default=50,
-        help="Capital usage percentage for grid strategy (default: 50)",
-    )
 
-    parser.add_argument(
-        "--silent",
-        action="store_true",
-        help="Silent mode (suppress TUI, run indefinitely by default)",
-    )
+    parser.add_argument("--leverage", type=int, default=1, help="Leverage (default: 1)")
+    parser.add_argument("--capital-usage", type=int, default=50, help="Capital usage %% (default: 50)")
+    parser.add_argument("--timeframe", default="15m", help="K-line timeframe (default: 15m)")
+    parser.add_argument("--silent", action="store_true", help="Silent mode (suppress TUI)")
+    parser.add_argument("--dry-run", action="store_true", help="Run a dry-run analysis for grid strategy (default: False)")
 
     args = parser.parse_args()
 
+    # Handle dry-run mode
+    if args.dry_run:
+        # For dry-run, we need to determine the futures symbol if futures is enabled
+        futures_symbol = args.symbol
+        if hasattr(args, 'futures') and args.futures:
+             if ":USDT" not in args.symbol and "/" in args.symbol:
+                  futures_symbol = f"{args.symbol}:USDT"
+        
+        # Fallback if args.futures is not defined (depending on argparse setup above, which might be missing)
+        # Assuming args.futures exists or defaulting logic.
+        
+        run_dry_run(
+            symbol=futures_symbol,
+            strategy_name=args.strategy,
+            leverage=args.leverage,
+            capital_usage=args.capital_usage,
+            initial_balance=int(args.initial_balance), # Use 0 by default to autodetect
+            timeframe=args.timeframe,
+        )
+        sys.exit(0)
+
+    # Handle backtest mode
     if args.backtest:
-        # Backtest mode
         run_backtest(
             symbol=args.symbol,
             strategy_name=args.strategy,
             backtest_bars=args.backtest_bars,
             backtest_start=args.backtest_start,
             backtest_end=args.backtest_end,
-            backtest_initial_balance=args.backtest_initial_balance,
+            backtest_initial_balance=int(args.initial_balance),
             backtest_slippage=args.backtest_slippage,
             backtest_commission=args.backtest_commission,
-            backtest_timeframe=args.backtest_timeframe,
+            backtest_timeframe=args.timeframe, # Use CLI arg
         )
     else:
         # Live trading mode
-        # For live trading, use perpetual symbol if not specified
         live_symbol = args.symbol
         market_type = "spot"
         
-        if args.futures:
+        # Check for futures arg
+        if hasattr(args, 'futures') and args.futures:
             market_type = "future"
             if ":USDT" not in args.symbol and "/" in args.symbol:
                  live_symbol = f"{args.symbol}:USDT"
-        
-        # Handle duration default
+        elif hasattr(args, 'market_type'):
+            market_type = args.market_type
+            
+        # Handle duration
         duration = args.duration
         if args.silent and duration == 300:
-             # If silent is on and duration is default, set to 0 (infinite)
-             # Assumption: user didn't explicitly set --duration 300 if they wanted silent infinite
-             duration = 0
+             duration = 0 # Infinite by default in silent mode
+             
 
         run_live_trading(
             symbol=live_symbol,

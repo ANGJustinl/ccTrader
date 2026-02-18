@@ -131,14 +131,32 @@ class DynamicGridStrategy(BaseStrategy):
             return
 
         # Trigger reset if price hits the boundaries (instead of stopping)
-        # Using a buffer to trigger slightly before/after the exact limit to capture trend
-        reset_needed = False
+        # However, if we have a position, we MUST check stop loss first
+        # Active Grid V2: If price breaks range, we first check if we need to STOP LOSS
+        # If no stop loss needed (e.g. profitable direction or within buffer), THEN we reset.
         
+        # 1. Check Stop Loss / Breakout Logic
+        if self.pivot_price:
+             direction = "UP" if current_price > self.pivot_price else "DOWN"
+        else:
+             direction = "UP" # Default fallback
+             
         if current_price >= self.upper_limit:
-            print(f"🔄 [Grid] Price ({current_price:.2f}) hit UPPER limit ({self.upper_limit:.2f}). Resetting grid UP...")
+             print(f"🔄 [Grid] Price ({current_price:.2f}) hit UPPER limit ({self.upper_limit:.2f}). Checking breakout...")
+             self._handle_breakout("UP", current_price)
+             return # _handle_breakout will reset grid if needed, or stop trading
+             
+        elif current_price <= self.lower_limit:
+             print(f"🔄 [Grid] Price ({current_price:.2f}) hit LOWER limit ({self.lower_limit:.2f}). Checking breakout...")
+             self._handle_breakout("DOWN", current_price)
+             return
+             
+        # No breakout, just standard check (this block usually won't be reached if limits are correct)
+        # But kept for safety
+        reset_needed = False
+        if current_price >= self.upper_limit:
             reset_needed = True
         elif current_price <= self.lower_limit:
-            print(f"🔄 [Grid] Price ({current_price:.2f}) hit LOWER limit ({self.lower_limit:.2f}). Resetting grid DOWN...")
             reset_needed = True
             
         if reset_needed:
@@ -234,6 +252,8 @@ class DynamicGridStrategy(BaseStrategy):
 
         # === Dynamic Position Sizing ===
         balance = self.broker.get_balance() if self.broker else Decimal("5000")
+        if balance <= 0: balance = Decimal("5000") # Fallback
+
         available_capital = balance * self.capital_usage * Decimal(str(self.leverage))
         qty_per_grid = available_capital / (Decimal(str(actual_grids)) * current_price)
         
@@ -290,8 +310,8 @@ class DynamicGridStrategy(BaseStrategy):
         batch_orders = []
         
         for level in self.grid_lines:
-            # Skip levels too close (within 10% of step)
-            if abs(level - current_price) < (step_size * Decimal("0.1")):
+            # Skip levels too close (within 20% of step) - Increased buffer from 10% to 20% to avoid instant fills
+            if abs(level - current_price) < (step_size * Decimal("0.2")):
                 continue
                 
             # Trend Filter (Optional - Strict Mode)
@@ -305,6 +325,11 @@ class DynamicGridStrategy(BaseStrategy):
 
     def on_order_update(self, order: Order):
         """Handle filled orders to place counter-orders"""
+        # [Safety Check] If grid lines are empty (e.g. during reset), skip placement logic to avoid crashes
+        if not self.grid_lines:
+            print(f"⚠️ [Grid] Order {order.id} filled but grid_lines is empty. Skipping counter-order.")
+            return
+
         # Track filled quantity to handle partial fills
         last_filled = self.order_fill_tracking.get(order.id, Decimal("0"))
         current_filled = order.filled_quantity
@@ -352,7 +377,10 @@ class DynamicGridStrategy(BaseStrategy):
     def _handle_breakout(self, direction: str, current_price: Decimal):
         """Handle active grid breakout"""
         # Cancel all open orders to stop adding risk
-        self.broker.cancel_all_orders(self.symbol)
+        try:
+            self.broker.cancel_all_orders(self.symbol)
+        except:
+            pass
         
         # Reset grid lines
         self.grid_lines = []
@@ -367,21 +395,50 @@ class DynamicGridStrategy(BaseStrategy):
             do_close = False
             stop_thresh = Decimal("0")
             
-            if direction == "UP" and side_str == "SHORT":
-                stop_thresh = self.upper_limit * (Decimal("1") + self.stop_loss_buffer)
-                if current_price >= stop_thresh:
-                    do_close = True
-            elif direction == "DOWN" and side_str == "LONG":
-                stop_thresh = self.lower_limit * (Decimal("1") - self.stop_loss_buffer)
-                if current_price <= stop_thresh:
-                    do_close = True
+            # CRITICAL FIX: Stop Loss Logic
+            # If Upper Limit broken (UP breakout):
+            # - If we are SHORT: We are losing money. CLOSE if price > Stop Threshold.
+            # - If we are LONG: We are making money (profit run). Do NOT close. Reset Grid UP.
+            
+            if direction == "UP":
+                if side_str == "SHORT":
+                    stop_thresh = self.upper_limit * (Decimal("1") + self.stop_loss_buffer)
+                    if current_price >= stop_thresh:
+                        do_close = True
+                        print(f"🛑 [Grid] UP Breakout & SHORT Position. STOP LOSS TRIGGERED at {current_price} (Thresh: {stop_thresh})")
+                    else:
+                        print(f"⚠️ [Grid] UP Breakout & SHORT Position. Inspecting... Price {current_price} < Stop {stop_thresh}")
+                else:
+                    # Long or Neutral. Reset Grid Up.
+                    print(f"🚀 [Grid] UP Breakout & LONG Position. Following trend...")
+                    self.cancel_and_reset_grid(current_price)
+                    return
+
+            elif direction == "DOWN":
+                if side_str == "LONG":
+                    stop_thresh = self.lower_limit * (Decimal("1") - self.stop_loss_buffer)
+                    if current_price <= stop_thresh:
+                        do_close = True
+                        print(f"🛑 [Grid] DOWN Breakout & LONG Position. STOP LOSS TRIGGERED at {current_price} (Thresh: {stop_thresh})")
+                    else:
+                        print(f"⚠️ [Grid] DOWN Breakout & LONG Position. Inspecting... Price {current_price} > Stop {stop_thresh}")
+                else:
+                    # Short or Neutral. Reset Grid Down.
+                    print(f"📉 [Grid] DOWN Breakout & SHORT Position. Following trend...")
+                    self.cancel_and_reset_grid(current_price)
+                    return
             
             if do_close:
-                print(f"[Grid] Stop Loss Triggered! ({current_price} crossed {stop_thresh:.2f}). Closing {side_str} position.")
                 # Execute Market Close
                 close_side = "buy" if side_str == "SHORT" else "sell"
-                self.create_market_order(self.symbol, close_side, float(position.quantity))
+                # Ensure quantity precision
+                qty = float(position.quantity)
+                print(f"🛑 [Grid] EXECUTING STOP LOSS: MARKET {close_side.upper()} {qty}")
+                self.create_market_order(self.symbol, close_side, qty)
             else:
-                print(f"[Grid] Breakout {direction}. Position {side_str} held (Price {current_price} within buffer {self.stop_loss_buffer}).")
+                 # If not closed (within buffer), reset is safer to catch volatility than doing nothing
+                 print(f"⚠️ [Grid] Breakout within buffer. Resetting grid to catch volatility.")
+                 self.cancel_and_reset_grid(current_price)
         else:
-            print(f"[Grid] Breakout {direction} detected. No position to close.")
+            print(f"[Grid] Breakout {direction} detected. No position to close. Resetting...")
+            self.cancel_and_reset_grid(current_price)

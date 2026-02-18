@@ -14,13 +14,13 @@ def run_grid_backtest():
     """Run backtest for Dynamic Grid Strategy"""
     
     # 1. Configure Backtest
-    symbol = "SIRENUSDT" # ETH often oscillates well
+    symbol = "PIPPINUSDT" # ETH often oscillates well
     
     # Use recent data (last 7 days)
     end_date = datetime.now(timezone.utc)
-    start_date = end_date - timedelta(days=7)
+    start_date = end_date - timedelta(days=1)
     
-    initial_balance = Decimal("10000")
+    initial_balance = Decimal("5000")
     commission_rate = Decimal("0.0004")  # 0.04%
     slippage = Decimal("0.0001")        # 0.01%
     
@@ -42,7 +42,7 @@ def run_grid_backtest():
             symbol=symbol,
             start_date=start_date,
             end_date=end_date,
-            timeframe="15m",
+            timeframe="1m",
             exchange="binance"
         )
         print(f"Downloaded {len(engine.all_bars)} bars.")
@@ -59,16 +59,17 @@ def run_grid_backtest():
     # 4. Initialize Strategy
     strategy = DynamicGridStrategy(
         symbol=symbol,
-        grid_number=30,
-        atr_multiplier=2.0,
-        min_profit_per_grid=0.0005, # 0.4%
-        position_size=0.1, # Will be updated below
+        grid_number=20,          # Aligned with live trading
+        atr_multiplier=4.0,      # Aligned with live trading
+        min_profit_per_grid=0.0005,
+        position_size=0.01,      # Fallback only, dynamic calc overrides
         trend_filter_enabled=True,
         trend_ema_period=50,
-        grid_spacing="geometric"
+        grid_spacing="geometric",
+        leverage=10,             # Aligned with live trading
+        capital_usage=0.5,       # Aligned with live trading
     )
-    # Update position size to be reasonable for 10000 USDT
-    strategy.position_size = Decimal("0.5") # 0.5 ETH per grid (~$1500)
+    # Dynamic position sizing will override position_size based on balance/leverage
     
     # 5. Run Backtest
     print("Running backtest...")
