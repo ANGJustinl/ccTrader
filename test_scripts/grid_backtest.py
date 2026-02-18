@@ -14,7 +14,7 @@ def run_grid_backtest():
     """Run backtest for Dynamic Grid Strategy"""
     
     # 1. Configure Backtest
-    symbol = "ETH/USDT" # ETH often oscillates well
+    symbol = "SIRENUSDT" # ETH often oscillates well
     
     # Use recent data (last 7 days)
     end_date = datetime.now(timezone.utc)
@@ -59,9 +59,9 @@ def run_grid_backtest():
     # 4. Initialize Strategy
     strategy = DynamicGridStrategy(
         symbol=symbol,
-        grid_number=10,
-        atr_multiplier=20.0,
-        min_profit_per_grid=0.001, # 0.1%
+        grid_number=30,
+        atr_multiplier=2.0,
+        min_profit_per_grid=0.0005, # 0.4%
         position_size=0.1, # Will be updated below
         trend_filter_enabled=True,
         trend_ema_period=50,

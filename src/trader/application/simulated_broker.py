@@ -241,44 +241,109 @@ class SimulatedBroker:
                 # 同向加仓
                 position.increase(fill)
             else:
-                # 反向减仓或平仓 - 创建与 position side 一致的 fill 用于 decrease
-                position_side_fill = fill.model_copy(update={"side": current_side})
-                realized_pnl = position.decrease(position_side_fill)
-
-                # 更新余额
-                self.balance += realized_pnl - fill.commission
-
-                # 发布交易完成事件 (用于回测统计)
-                self.event_bus.publish(
-                    Event(
-                        type=EventType.TRADE_COMPLETED,
-                        timestamp=self.clock.now(),
-                        data={
-                            "symbol": symbol,
-                            "side": current_side.value,
-                            "entry_price": str(position.entry_price), # Note: this is avg entry price
-                            "exit_price": str(fill.price),
-                            "quantity": str(fill.quantity),
-                            "pnl": str(realized_pnl),
-                            "commission": str(fill.commission),
-                        },
+                # 反向减仓或平仓
+                if fill.quantity > position.quantity:
+                    # 反手 (Flip Position)
+                    # 1. 平掉当前仓位
+                    close_qty = position.quantity
+                    new_open_qty = fill.quantity - close_qty
+                    
+                    # 计算平仓部分的 commission
+                    close_commission = fill.commission * (close_qty / fill.quantity)
+                    
+                    # 创建平仓 fill (side 必须与 current_side 相同)
+                    closing_fill = fill.model_copy(update={
+                        "quantity": close_qty, 
+                        "side": current_side
+                    })
+                    
+                    realized_pnl = position.decrease(closing_fill)
+                    self.balance += realized_pnl - close_commission
+                    
+                    # 发布并删除旧仓位
+                    self._publish_trade_events(symbol, current_side, position.entry_price, fill.price, close_qty, realized_pnl, close_commission, closed=True)
+                    del self.positions[symbol]
+                    
+                    # 2. 开新仓
+                    new_side = fill.side
+                    # 剩余 commission
+                    open_commission = fill.commission - close_commission
+                    
+                    self.positions[symbol] = PositionFactory.create_position(
+                        symbol=symbol,
+                        side=new_side,
+                        quantity=new_open_qty,
+                        entry_price=fill.price,
+                        leverage=1,
                     )
-                )
-
-                if position.is_closed:
-                    # 发布平仓事件
+                    
                     self.event_bus.publish(
                         Event(
-                            type=EventType.POSITION_CLOSED,
+                            type=EventType.POSITION_OPENED,
+                            timestamp=self.clock.now(),
+                            data={"symbol": symbol, "side": new_side.value, "quantity": str(new_open_qty)},
+                        )
+                    )
+                    # 开仓交易事件 (PnL=0)
+                    self.event_bus.publish(
+                        Event(
+                            type=EventType.TRADE_COMPLETED,
                             timestamp=self.clock.now(),
                             data={
                                 "symbol": symbol,
-                                "realized_pnl": str(realized_pnl),
-                                "commission": str(fill.commission),
+                                "side": new_side.value,
+                                "entry_price": str(fill.price),
+                                "exit_price": str(fill.price),
+                                "quantity": str(new_open_qty),
+                                "pnl": "0",
+                                "commission": str(open_commission),
                             },
                         )
                     )
-                    del self.positions[symbol]
+                    
+                else:
+                    # 普通减仓
+                    position_side_fill = fill.model_copy(update={"side": current_side})
+                    realized_pnl = position.decrease(position_side_fill)
+    
+                    # 更新余额
+                    self.balance += realized_pnl - fill.commission
+                    
+                    self._publish_trade_events(symbol, current_side, position.entry_price, fill.price, fill.quantity, realized_pnl, fill.commission, closed=position.is_closed)
+                    
+                    if position.is_closed:
+                        del self.positions[symbol]
+
+    def _publish_trade_events(self, symbol, side, entry_price, exit_price, quantity, pnl, commission, closed=False):
+        """Helper to publish trade and close events"""
+        self.event_bus.publish(
+            Event(
+                type=EventType.TRADE_COMPLETED,
+                timestamp=self.clock.now(),
+                data={
+                    "symbol": symbol,
+                    "side": side.value,
+                    "entry_price": str(entry_price), 
+                    "exit_price": str(exit_price),
+                    "quantity": str(quantity),
+                    "pnl": str(pnl),
+                    "commission": str(commission),
+                },
+            )
+        )
+
+        if closed:
+            self.event_bus.publish(
+                Event(
+                    type=EventType.POSITION_CLOSED,
+                    timestamp=self.clock.now(),
+                    data={
+                        "symbol": symbol,
+                        "realized_pnl": str(pnl),
+                        "commission": str(commission),
+                    },
+                )
+            )
 
     def cancel_order(self, order_id: str) -> bool:
         """取消订单
@@ -320,6 +385,12 @@ class SimulatedBroker:
         """
         order_ids = self.open_orders.get(symbol, [])
         return [self.orders[oid] for oid in order_ids if oid in self.orders]
+
+    def cancel_all_orders(self, symbol: str) -> None:
+        """Cancel all open orders for a symbol."""
+        open_orders = self.get_open_orders(symbol)
+        for order in open_orders:
+            self.cancel_order(order.id)
 
     def get_position(self, symbol: str) -> Optional[Position]:
         """获取当前仓位

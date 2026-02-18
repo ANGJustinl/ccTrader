@@ -105,38 +105,96 @@ class DynamicGridStrategy(BaseStrategy):
         
         # print(f"DEBUG: Indics - ATR={atr:.2f}, pivot={pivot:.2f}, price={current_price:.2f}")
 
-        # 2. Risk Management: Check Range Breakout
+        # 2. Active Grid: Check and Reset
         if self.grid_lines:
-            if current_price > self.upper_limit:
-                print(f"[Grid] Price broke UPPER limit ({current_price} > {self.upper_limit}). Stopping Sell orders.")
-                self._handle_breakout("UP", current_price)
-                return
-            elif current_price < self.lower_limit:
-                print(f"[Grid] Price broke LOWER limit ({current_price} < {self.lower_limit}). Stopping Buy orders.")
-                self._handle_breakout("DOWN", current_price)
-                return
+            self.check_and_reset_grid(current_price)
 
-        # 3. Initialize Grid if not exists and price is stable (near pivot)
-        # For simplicity, we create grid if no active orders and no position
+        # 3. Initialize Grid if not exists
         active_orders = self.broker.get_open_orders(self.symbol)
         position = self.broker.get_position(self.symbol)
         if hasattr(position, 'quantity') and position.quantity == 0:
              position = None
         
-        if not self.grid_lines and not active_orders and position is None:
-            # Check if price is within "safe" range to start (e.g. within BB bands)
-            # Starting grid...
-            print(f"[Grid DEBUG] Initializing grid: pivot={pivot:.2f}, atr={atr:.4f}, price={current_price}")
+        if not self.grid_lines and not active_orders:
+            # Initialize grid (even if position exists - we build around it)
+            print(f"[Grid DEBUG] Initializing grid: pivot={pivot:.2f}, atr={atr:.4f}, price={current_price:.4f}")
             self._calculate_and_place_grids(pivot, atr, current_price)
         elif self.grid_lines:
-            pass  # Grid already active
+            pass
         else:
-            print(f"[Grid DEBUG] Skip init: grid_lines={len(self.grid_lines)}, active_orders={len(active_orders)}, position={position}")
+            # print(f"[Grid DEBUG] Skip init: grid_lines={len(self.grid_lines)}, active_orders={len(active_orders)}, position={position}")
+            pass
+
+    def check_and_reset_grid(self, current_price: Decimal):
+        """Check if price drifted too far and reset grid if needed."""
+        if not self.grid_lines:
+            return
+
+        # Trigger reset if price hits the boundaries (instead of stopping)
+        # Using a buffer to trigger slightly before/after the exact limit to capture trend
+        reset_needed = False
+        
+        if current_price >= self.upper_limit:
+            print(f"🔄 [Grid] Price ({current_price:.2f}) hit UPPER limit ({self.upper_limit:.2f}). Resetting grid UP...")
+            reset_needed = True
+        elif current_price <= self.lower_limit:
+            print(f"🔄 [Grid] Price ({current_price:.2f}) hit LOWER limit ({self.lower_limit:.2f}). Resetting grid DOWN...")
+            reset_needed = True
+            
+        if reset_needed:
+            self.cancel_and_reset_grid(current_price)
+
+    def cancel_and_reset_grid(self, current_price: Decimal):
+        """Cancel all orders and restart grid at new price."""
+        print(f"🔄 [Grid] Executing Dynamic Reset at {current_price:.2f}...")
+        
+        # 1. Cancel all open orders
+        try:
+            if self.broker:
+                self.broker.cancel_all_orders(self.symbol)
+        except Exception as e:
+            print(f"⚠️ [Grid] Failed to cancel orders during reset: {e}")
+            
+        # 2. Reset Grid State
+        self.grid_lines = []
+        self.upper_limit = None
+        self.lower_limit = None
+        
+        # 3. Recalculate and Place New Grid
+        # Recalculate indicators for new pivot
+        if len(self.bar_history) < self.min_history:
+             print("⚠️ [Grid] Not enough history for reset. Waiting next bar.")
+             return
+             
+        closes = [b.close for b in self.bar_history]
+        ema_values = calculate_ema(closes, period=self.trend_ema_period)
+        bb_values = calculate_bollinger_bands(closes, period=self.bb_period, std_dev=self.bb_std)
+        atr_values = calculate_atr([b.high for b in self.bar_history], [b.low for b in self.bar_history], closes, period=self.atr_period)
+
+        if not (ema_values and bb_values and atr_values):
+            print("⚠️ [Grid] Indicators unavailable for reset.")
+            return
+            
+        # Use EMA as pivot for trend following, or BB Middle for mean reversion
+        # Active Grid V2 favors following the drift, so we anchor to current price or EMA
+        # Here we use BB Middle (SMA 20) as the "fair value" anchor, but ensure range covers current price
+        pivot = bb_values[-1].middle
+        atr = atr_values[-1]
+        
+        print(f"🔄 [Grid] Re-initializing: Pivot={pivot:.2f}, ATR={atr:.2f}")
+        self._calculate_and_place_grids(pivot, atr, current_price)
 
     def _calculate_and_place_grids(self, pivot: Decimal, atr: Decimal, current_price: Decimal):
         """Calculate grid levels and place initial orders"""
         
         range_width = atr * self.atr_multiplier
+        
+        # Active Grid V2: Ensure range always brackets current price
+        # If current price is far from pivot, shift pivot to current price to center the grid
+        if abs(current_price - pivot) > (range_width * Decimal("0.5")):
+            print(f"⚡ [Grid] Price far from pivot. Centering grid on Price {current_price:.2f} instead of SMA {pivot:.2f}")
+            pivot = current_price
+            
         self.upper_limit = pivot + range_width
         self.lower_limit = pivot - range_width
         self.pivot_price = pivot
@@ -178,18 +236,22 @@ class DynamicGridStrategy(BaseStrategy):
         balance = self.broker.get_balance() if self.broker else Decimal("5000")
         available_capital = balance * self.capital_usage * Decimal(str(self.leverage))
         qty_per_grid = available_capital / (Decimal(str(actual_grids)) * current_price)
-        # ETH min lot = 0.001, round down to 3 decimals
-        qty_per_grid = (qty_per_grid * 1000).to_integral_value(rounding='ROUND_DOWN') / 1000
-        if qty_per_grid < Decimal("0.001"):
+        
+        # Determine precision based on price scale or generic safe bet (5 decimals)
+        # TODO: Fetch lot size from exchange metadata if possible
+        precision = Decimal("0.00001")
+        qty_per_grid = (qty_per_grid / precision).to_integral_value(rounding='ROUND_DOWN') * precision
+        
+        if qty_per_grid < precision:
             print(f"[Grid] Calculated qty too small: {qty_per_grid}. Skipping.")
             return
         self.position_size = qty_per_grid
-        print(f"[Grid] Dynamic position size: {qty_per_grid} ETH/grid (Balance={balance:.2f}, Leverage={self.leverage}x, Usage={self.capital_usage*100:.0f}%, Grids={actual_grids})")
+        print(f"[Grid] Dynamic position size: {qty_per_grid} (Balance={balance:.2f}, Leverage={self.leverage}x, Usage={self.capital_usage*100:.0f}%, Grids={actual_grids})")
 
         if self.grid_spacing == "geometric":
              # Calculate Ratio
              ratio = (self.upper_limit / self.lower_limit) ** (Decimal("1") / Decimal(actual_grids))
-             print(f"[Grid] Initializing (Geometric): Range=[{self.lower_limit}, {self.upper_limit}], Grids={actual_grids}, Ratio={ratio:.4f}")
+             print(f"[Grid] Initializing (Geometric): Range=[{self.lower_limit:.2f}, {self.upper_limit:.2f}], Grids={actual_grids}, Ratio={ratio:.4f}")
              
              for i in range(actual_grids + 1):
                  level = self.lower_limit * (ratio ** i)
@@ -210,33 +272,35 @@ class DynamicGridStrategy(BaseStrategy):
                 self.grid_lines.append(level)
             
         # Place Orders
-        # Logic:
-        # If Level > Current Price -> Place SELL Limit
-        # If Level < Current Price -> Place BUY Limit
-        # Skip level closest to current price to avoid immediate fill spread
+        # Active Grid V2 Logic:
+        # If Trend Filter enabled:
+        # UP Trend (Price > EMA) -> Only Place BUY grids (or skewed)? 
+        # Actually for a grid, "Buying in Uptrend" means buying dips. "Selling in Uptrend" means selling rallies (taking profit).
+        # A Neutral Grid captures both. 
+        # But if the trend is STRONG UP, Shorting at the top of range is risky (price blows through).
+        # So we restrict opening NEW Short positions (Sell Orders) if trend is UP? 
+        # No, a grid MUST sell to close the buy. 
+        # The risk is opening a *naked* short grid at the top.
+        # For simplicity in V2: We allow both, but relied on Reset to handle drift. 
+        # Or we can implement "Long Only" grid for Uptrend (Only Buy orders below price, and Sell orders ONLY to close positions).
+        # But Broker doesn't track "Close" vs "Open" easily without position management.
+        # Let's stick to Standard Grid but with Dynamic Reset for now.
         
         self.grid_orders = {}
         batch_orders = []
         
         for level in self.grid_lines:
             # Skip levels too close (within 10% of step)
-            # For geometric, step varies. We use the approximate step_size calculated above or local diff
             if abs(level - current_price) < (step_size * Decimal("0.1")):
                 continue
                 
+            # Trend Filter (Optional - Strict Mode)
+            # If UP trend, maybe we skip the highest sell orders to avoid getting run over?
+            # For now, we trust the Reset logic to cut losses if it blows through.
+            
             if level > current_price:
-                # Sell Order (Potential Short)
-                # If Trend Filter enabled:
-                # Uptrend -> Do NOT open Shorts (Skip Sell Orders)
-                if self.trend_filter_enabled and self.trend_direction == "UP":
-                    continue
                 self.create_limit_order(self.symbol, "sell", float(self.position_size), float(level))
             else:
-                # Buy Order (Potential Long)
-                # If Trend Filter enabled:
-                # Downtrend -> Do NOT open Longs (Skip Buy Orders)
-                if self.trend_filter_enabled and self.trend_direction == "DOWN":
-                    continue
                 self.create_limit_order(self.symbol, "buy", float(self.position_size), float(level))
 
     def on_order_update(self, order: Order):

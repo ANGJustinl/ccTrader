@@ -61,6 +61,7 @@ class StatePersistence:
                     "orders": {
                         order_id: self._order_to_dict(order)
                         for order_id, order in orders.items()
+                        if order.status in [OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.PARTIAL_FILLED]
                     },
                 }
 

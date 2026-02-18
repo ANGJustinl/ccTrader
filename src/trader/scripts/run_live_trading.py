@@ -37,7 +37,7 @@ from src.trader.application.strategies.grid import DynamicGridStrategy
 from src.trader.application.risk_manager import RiskManager
 from src.trader.application.backtest_engine import BacktestEngine
 from src.trader.application.backtest_report import BacktestReportGenerator
-from src.trader.infrastructure.event_bus import EventBus
+from src.trader.infrastructure.event_bus import EventBus, EventType
 from src.trader.infrastructure.data_downloader import DataDownloader
 from src.trader.infrastructure.real_broker import RealBroker
 from src.trader.infrastructure.state_persistence import StatePersistence
@@ -149,7 +149,7 @@ def run_live_trading(
         initial_balance=Decimal(str(initial_balance)),
         max_drawdown_pct=Decimal("0.05"),
         daily_loss_limit_pct=Decimal("0.10"),
-        max_order_size=Decimal("100.0"),  # ETH max per order
+        max_order_size=Decimal("1000000000.0"),  # Effectively unlimited quantity, relying on value limits
         max_position_pct=Decimal("0.5"),
     )
     risk_manager._leverage = leverage  # Pass leverage for margin-based position checks
@@ -186,9 +186,9 @@ def run_live_trading(
         print("\n[SETUP] Using Dynamic Grid Strategy (Optimized)")
         strategy = DynamicGridStrategy(
              symbol=symbol,
-             grid_number=10, 
-             atr_multiplier=20.0,
-             min_profit_per_grid=0.003,
+             grid_number=20, 
+             atr_multiplier=4.0,
+             min_profit_per_grid=0.0005,
              stop_loss_buffer=0.005,
              position_size=0.01, # Fallback only, dynamic calc overrides this
              trend_filter_enabled=True,
@@ -213,6 +213,23 @@ def run_live_trading(
     strategy.broker = broker
     strategy.clock = clock
     strategy.event_bus = event_bus
+
+    # Wired up event listeners
+    def on_order_filled(event):
+        try:
+            # Convert event data back to Order object or pass data dict
+            # Strategy expects Order object usually, let's check grid.py
+            # grid.py on_order_update expects Order object.
+            # But event data is a dict. We need to fetch the Order from broker.
+            order_id = event.data.get("order_id")
+            if order_id:
+                order = broker.orders.get(order_id)
+                if order:
+                    strategy.on_order_update(order)
+        except Exception as e:
+            print(f"❌ [MAIN] Error processing order fill: {e}")
+
+    event_bus.subscribe(EventType.ORDER_FILLED, on_order_filled)
 
     # Signal handler for graceful shutdown
     running = True

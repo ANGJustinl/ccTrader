@@ -123,13 +123,16 @@ class RealBroker:
         self.positions: Dict[str, Position] = {}  # symbol -> Position
         self.orders: Dict[str, Order] = {}  # order_id -> Order
         self.market_prices: Dict[str, Decimal] = {}  # symbol -> current price
+        self.leverage_map: Dict[str, int] = {}  # symbol -> leverage
         self._last_filled_quantity: Dict[str, Decimal] = {}  # exchange_order_id -> last filled qty
 
         # Subscribe to market data updates
         self._setup_event_listeners()
 
-        # Try to restore state from persistence
-        self._try_restore_state()
+        # Try to restore state from persistence, otherwise fetch from exchange
+        if not self._try_restore_state():
+            print("⚠️ [REAL] State file not found or failed to load. Syncing from exchange...")
+            self.sync_initial_state()
 
     def _setup_event_listeners(self) -> None:
         """Setup event listeners for market data updates."""
@@ -189,14 +192,53 @@ class RealBroker:
             if self.testnet and self.market_type == "future":
                 try:
                     # Construct raw params
+                    try:
+                        # Ensure markets are loaded (should be done in __init__ but just in case)
+                        if not self.exchange.markets:
+                            self.exchange.load_markets()
+                        
+                        # Try ccxt precision logic first
+                        qty_str = self.exchange.amount_to_precision(order.symbol, order.quantity)
+                        price_str = self.exchange.price_to_precision(order.symbol, order.price)
+                        print(f"📊 [REAL] Precision (CCXT): Qty={qty_str}, Price={price_str}")
+                    except Exception as e:
+                        print(f"⚠️ [REAL] CCXT Precision Failed ({e}). Fetching live info...")
+                        # Fallback: fetch symbol info directly
+                        try:
+                            info = self.exchange.fapiPublicGetExchangeInfo()
+                            symbol_info = next((s for s in info['symbols'] if s['symbol'] == binance_symbol), None)
+                            if symbol_info:
+                                # Parse precision from filters
+                                price_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'PRICE_FILTER'), None)
+                                lot_size = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+                                
+                                def get_decimals(step):
+                                    if not step: return 0
+                                    s = f"{float(step):.8f}".rstrip('0')
+                                    return len(s.split('.')[1]) if '.' in s else 0
+
+                                price_prec = get_decimals(price_filter['tickSize']) if price_filter else 5
+                                qty_prec = get_decimals(lot_size['stepSize']) if lot_size else 3
+                                
+                                qty_str = f"{float(order.quantity):.{qty_prec}f}"
+                                price_str = f"{float(order.price):.{price_prec}f}"
+                                print(f"📊 [REAL] Precision (Live): Qty={qty_str}, Price={price_str}")
+                            else:
+                                raise ValueError("Symbol not found in exchange info")
+                        except Exception as ex:
+                            print(f"❌ [REAL] Precision Fallback Failed: {ex}")
+                            # Last resort fallback
+                            qty_str = f"{float(order.quantity):.3f}"
+                            price_str = f"{float(order.price):.5f}"
+
                     fapi_params = {
                         "symbol": binance_symbol,
                         "side": side.upper(),
                         "type": type_.upper(),
-                        "quantity": round(float(order.quantity), 3),  # ETH qty precision: 3
+                        "quantity": float(qty_str), 
                     }
                     if order.order_type == "limit":
-                        fapi_params["price"] = round(float(order.price), 2)  # ETH price precision: 2
+                        fapi_params["price"] = float(price_str)
                         fapi_params["timeInForce"] = "GTC"
                     
                     print(f"🔍 [REAL] Raw Submit: {fapi_params}")
@@ -399,12 +441,16 @@ class RealBroker:
         if symbol not in self.positions:
             # First position open
             side = Side.LONG if fill.side == Side.LONG else Side.SHORT
+            
+            # Get leverage from map or default to 1
+            leverage = self.leverage_map.get(symbol, 1)
+            
             self.positions[symbol] = PositionFactory.create_position(
                 symbol=symbol,
                 side=side,
                 quantity=fill.quantity,
                 entry_price=fill.price,
-                leverage=1,
+                leverage=leverage,
             )
 
             self.event_bus.publish(
@@ -596,7 +642,117 @@ class RealBroker:
         self._sync_running = True
         self._sync_thread = threading.Thread(target=self._sync_loop, daemon=True)
         self._sync_thread.start()
-        print(f"✅ [REAL] 订单同步已启动 (间隔: {interval}秒)")
+        print(f"✅ [REAL] Order sync started (every {interval}s)")
+
+    def sync_initial_state(self) -> None:
+        """Sync initial state from exchange (Positions & Open Orders)."""
+        print("🔄 [REAL] Starting initial exchange sync...")
+        try:
+            # 1. Sync Positions
+            if self.testnet and self.market_type == "future":
+                try:
+                    # Fetch account info from Binance Futures
+                    account_info = self.exchange.fapiPrivateV2GetAccount()
+                    positions_data = account_info.get("positions", [])
+                    
+                    with self._lock:
+                        for pos in positions_data:
+                            amt = float(pos.get("positionAmt", 0))
+                            if amt != 0:
+                                symbol_raw = pos.get("symbol")
+                                # Construct symbol: e.g. ETHUSDT -> ETH/USDT:USDT
+                                # Simple heuristic: if ends with USDT, split
+                                if symbol_raw.endswith("USDT"):
+                                    base = symbol_raw[:-4]
+                                    std_symbol = f"{base}/USDT:USDT"
+                                else:
+                                    std_symbol = symbol_raw # Fallback
+                                
+                                side = Side.LONG if amt > 0 else Side.SHORT
+                                quantity = abs(Decimal(str(amt)))
+                                entry_price = Decimal(str(pos.get("entryPrice", 0)))
+                                leverage = int(pos.get("leverage", 1))
+                                
+                                self.positions[std_symbol] = PositionFactory.create_position(
+                                    symbol=std_symbol,
+                                    side=side,
+                                    quantity=quantity,
+                                    entry_price=entry_price,
+                                    leverage=leverage,
+                                )
+                                self.leverage_map[std_symbol] = leverage
+                                print(f"   Positions: {side.value} {quantity} {std_symbol} @ {entry_price}")
+                except Exception as e:
+                     print(f"⚠️ [REAL] Failed to sync positions: {e}")
+
+            # 2. Sync Open Orders
+            try:
+                open_orders = []
+                if self.testnet and self.market_type == "future":
+                    open_orders_raw = self.exchange.fapiPrivateGetOpenOrders()
+                    for o in open_orders_raw:
+                        # Raw response mapping
+                        open_orders.append({
+                            "id": str(o["orderId"]),
+                            "symbol": o["symbol"],
+                            "side": o["side"].lower(),
+                            "type": o["type"].lower(),
+                            "amount": float(o["origQty"]),
+                            "price": float(o["price"]),
+                            "filled": float(o["executedQty"]),
+                            "status": o["status"].lower(), # 'NEW' -> 'new'
+                            "timestamp": o["time"]
+                        })
+                else:
+                    open_orders = self.exchange.fetch_open_orders()
+                
+                with self._lock:
+                    for o in open_orders:
+                        # Map status
+                        status_str = o["status"].upper() # 'NEW' -> 'NEW'
+                        status_map = {
+                            "NEW": OrderStatus.SUBMITTED,
+                            "PARTIALLY_FILLED": OrderStatus.PARTIAL_FILLED,
+                            "FILLED": OrderStatus.FILLED,
+                            "CANCELED": OrderStatus.CANCELLED,
+                            "REJECTED": OrderStatus.REJECTED,
+                            "EXPIRED": OrderStatus.CANCELLED
+                        }
+                        # Handle lowercase too if fetch_open_orders returns lowercase
+                        if status_str not in status_map:
+                             # Try lowercase keys just in case
+                             status_upper = status_str.upper()
+                             status = status_map.get(status_upper, OrderStatus.PENDING)
+                        else:
+                             status = status_map[status_str]
+                        
+                        # Symbol handling
+                        symbol = o["symbol"]
+                        # standardize symbol if raw
+                        if not "/" in symbol and symbol.endswith("USDT"):
+                             symbol = f"{symbol[:-4]}/USDT:USDT"
+
+                        order = Order(
+                            id=str(o["id"]),
+                            symbol=symbol,
+                            side=o["side"],
+                            order_type=o["type"],
+                            quantity=Decimal(str(o["amount"])),
+                            price=Decimal(str(o["price"])) if o.get("price") else None,
+                            status=status,
+                            filled_quantity=Decimal(str(o.get("filled", 0))),
+                            # timestamp handling simplified
+                        )
+                        self.orders[order.id] = order
+                if open_orders:
+                    print(f"   Open Orders: {len(open_orders)} synced")
+            except Exception as e:
+                 print(f"⚠️ [REAL] Failed to sync orders: {e}")
+
+            print("✅ [REAL] Initial sync complete.")
+
+        except Exception as e:
+            print(f"❌ [REAL] Initial Sync Critical Error: {e}")
 
     def stop_order_sync(self) -> None:
         """Stop background order synchronization."""
@@ -819,6 +975,12 @@ class RealBroker:
                         'leverage': leverage
                     })
                     print(f"✅ [REAL] Leverage set to {leverage}x for {symbol}")
+                    
+                    with self._lock:
+                        self.leverage_map[symbol] = leverage
+                        # Update existing position if any
+                        if symbol in self.positions:
+                            self.positions[symbol].leverage = leverage
                     return True
                 except Exception as e:
                     print(f"❌ [REAL] Raw Set Leverage Failed: {e}")
@@ -827,6 +989,12 @@ class RealBroker:
             # Use CCXT for others
             self.exchange.set_leverage(leverage, binance_symbol)
             print(f"✅ [REAL] Leverage set to {leverage}x for {symbol}")
+            
+            with self._lock:
+                self.leverage_map[symbol] = leverage
+                # Update existing position if any
+                if symbol in self.positions:
+                    self.positions[symbol].leverage = leverage
             return True
         except Exception as e:
             print(f"⚠️ [REAL] Failed to set leverage: {e}")
