@@ -235,16 +235,21 @@ class DynamicGridStrategy(BaseStrategy):
         
         if new_fill_qty > Decimal("0"):
             self.order_fill_tracking[order.id] = current_filled
-            fill_price = Decimal(str(order.price)) if order.price else order.avg_fill_price
-            if not fill_price: return
+            # Prefer actual fill price (avg_fill_price) over the limit price (order.price)
+            fill_price = order.avg_fill_price or (Decimal(str(order.price)) if order.price else None)
+            if not fill_price or fill_price <= 0:
+                print(f"⚠️ [Grid] No fill price for order {order.id}, skipping counter-order")
+                return
 
             closest_level = min(self.grid_lines, key=lambda x: abs(x - fill_price))
+            print(f"📊 [Grid] Fill: {order.side} {new_fill_qty} @ {fill_price:.5f} → closest grid={closest_level:.5f}")
             
             if order.side == "buy":
                 try:
                     idx = self.grid_lines.index(closest_level)
                     if idx + 1 < len(self.grid_lines):
                         target_level = self.grid_lines[idx + 1]
+                        print(f"   ↑ Placing SELL counter-order @ {target_level:.5f}")
                         self.create_limit_order(self.symbol, "sell", float(new_fill_qty), float(target_level))
                 except: pass
             elif order.side == "sell":
@@ -252,12 +257,14 @@ class DynamicGridStrategy(BaseStrategy):
                     idx = self.grid_lines.index(closest_level)
                     if idx - 1 >= 0:
                         target_level = self.grid_lines[idx - 1]
+                        print(f"   ↓ Placing BUY counter-order @ {target_level:.5f}")
                         self.create_limit_order(self.symbol, "buy", float(new_fill_qty), float(target_level))
                 except: pass
 
         if order.status in ["filled", "cancelled", "rejected", "expired"]:
             if order.id in self.order_fill_tracking:
                 del self.order_fill_tracking[order.id]
+
 
     def _handle_breakout(self, direction: str, current_price: Decimal):
         """

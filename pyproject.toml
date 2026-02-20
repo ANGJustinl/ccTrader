@@ -4,10 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trader"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI-powered perpetual futures trading agent system using DDD architecture"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [
     {name = "Trader Team"}
 ]

@@ -72,8 +72,8 @@ def print_account_summary(broker: RealBroker) -> None:
     summary = broker.get_account_summary()
     print("\nACCOUNT SUMMARY")
     print("-" * 80)
-    print(f"| Balance: ${summary['balance']:,.2f} | Equity: ${summary['equity']:,.2f} | Positions: {summary['positions']} |")
-    print(f"| Open Orders: {summary['open_orders']} | Return: {summary['return_pct']:.2f}% |")
+    print(f"| Wallet Balance: ${summary['balance']:,.2f} | Equity: ${summary['equity']:,.2f} | UnPnL: ${summary['unrealized_pnl']:,.2f} |")
+    print(f"| Positions: {summary['positions']} | Open Orders: {summary['open_orders']} | Return: {summary['return_pct']:.2f}% |")
     print("-" * 80)
 
 
@@ -124,6 +124,7 @@ def run_live_trading(
     capital_usage: int = 50,
     timeframe: str = "15m",
     silent: bool = False,
+    auto_liquidate: bool = False,
 ) -> None:
     """
     Run live trading with live market data and order sync on Binance Testnet.
@@ -138,11 +139,18 @@ def run_live_trading(
         leverage: Leverage value (default: 1)
         timeframe: K-line timeframe (default: 15m)
         silent: Silent mode (suppress TUI, run indefinitely by default)
+        auto_liquidate: If True, auto cancel all orders and close all positions
+                        when risk limits (max drawdown / daily loss) are breached.
     """
     # Initialize components
     event_bus = EventBus()
     clock = RealtimeClock()
     data_downloader = DataDownloader(exchange_name="binance", env_file=".env.dev")
+
+    if auto_liquidate:
+        print("🛡️ [RISK] Auto-liquidation ENABLED: will cancel orders & close positions on risk breach")
+    else:
+        print("⚠️ [RISK] Auto-liquidation DISABLED: orders/positions will NOT be closed on risk breach")
     
     # Configure DataDownloader for futures if needed
     if market_type == "future":
@@ -176,11 +184,18 @@ def run_live_trading(
     broker = RealBroker(
         event_bus=event_bus,
         env_file=".env.dev",
-        testnet=True,
+        testnet=False,
         risk_manager=risk_manager,
         state_persistence=state_persistence,
         market_type=market_type,
     )
+
+    # Register symbol so sync_initial_state can fetch orders with symbol filter
+    # (avoids rate-limit warnings and ensures correct position/order sync)
+    if symbol not in broker._watched_symbols:
+        broker._watched_symbols.append(symbol)
+    # Re-sync now that we know the symbol (initial sync in __init__ had no symbol yet)
+    broker.sync_initial_state(symbols=[symbol])
 
     # Create strategy based on strategy_name parameter
     if strategy_name.lower() == "dramm":
@@ -244,6 +259,10 @@ def run_live_trading(
             if exchange_id:
                 order = broker.orders.get(exchange_id)
                 if order:
+                    print(f"📬 [FILL EVENT] id={exchange_id} side={order.side} "
+                          f"filled={order.filled_quantity}/{order.quantity} "
+                          f"price={order.price} avg={order.avg_fill_price} "
+                          f"status={order.status}")
                     strategy.on_order_update(order)
                 else:
                     print(f"⚠️ [MAIN] Order not found for exchange_id={exchange_id}")
@@ -392,6 +411,29 @@ def run_live_trading(
                 save_interval = 100 if silent else 10
                 if iteration % save_interval == 0:
                     broker._save_state_periodically()
+
+                # ── Risk breach check ──────────────────────────────────────────
+                if risk_manager.trading_halted:
+                    print(f"\n🔥 [RISK] Trading halted! Drawdown={risk_manager.current_drawdown*100:.2f}%")
+                    if auto_liquidate:
+                        print("🚨 [RISK] Auto-liquidation triggered!")
+                        try:
+                            broker.cancel_all_orders(symbol)
+                            print("✅ [RISK] All orders cancelled")
+                        except Exception as ex:
+                            print(f"⚠️ [RISK] Cancel orders failed: {ex}")
+                        try:
+                            broker.close_all_positions(symbol)
+                            print("✅ [RISK] All positions closed")
+                        except Exception as ex:
+                            print(f"⚠️ [RISK] Close positions failed: {ex}")
+                        print("🛑 [RISK] Stopping trading loop due to risk breach")
+                        running = False
+                        break
+                    else:
+                        # Without auto-liquidate, just block new orders (already done by risk_manager)
+                        print("   ⚠️  New orders blocked. Use --auto-liquidate to enable auto close.")
+                # ──────────────────────────────────────────────────────────────
 
                 # Record equity snapshot for Sharpe/drawdown (every ~20s)
                 if iteration % 10 == 0:
@@ -744,9 +786,9 @@ def run_dry_run(
                     'options': {'defaultType': 'future'},
                     'urls': {
                         'api': {
-                            'fapiPublic': 'https://testnet.binancefuture.com/fapi/v1',
-                            'fapiPrivate': 'https://testnet.binancefuture.com/fapi/v1',
-                            'fapiPrivateV2': 'https://testnet.binancefuture.com/fapi/v2',
+                            'fapiPublic': 'https://binancefuture.com/fapi/v1',
+                            'fapiPrivate': 'https://binancefuture.com/fapi/v1',
+                            'fapiPrivateV2': 'https://binancefuture.com/fapi/v2',
                         },
                     }
                 })
@@ -968,6 +1010,12 @@ if __name__ == "__main__":
     parser.add_argument("--timeframe", default="15m", help="K-line timeframe (default: 15m)")
     parser.add_argument("--silent", action="store_true", help="Silent mode (suppress TUI)")
     parser.add_argument("--dry-run", action="store_true", help="Run a dry-run analysis for grid strategy (default: False)")
+    parser.add_argument(
+        "--auto-liquidate",
+        action="store_true",
+        default=False,
+        help="Auto cancel orders and close positions when risk limits (max drawdown/daily loss) are breached (default: False)",
+    )
 
     args = parser.parse_args()
 
@@ -1034,4 +1082,5 @@ if __name__ == "__main__":
             leverage=args.leverage,
             capital_usage=args.capital_usage,
             silent=args.silent,
+            auto_liquidate=args.auto_liquidate,
         )

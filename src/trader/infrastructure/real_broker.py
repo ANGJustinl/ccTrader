@@ -125,13 +125,16 @@ class RealBroker:
         self.market_prices: Dict[str, Decimal] = {}  # symbol -> current price
         self.leverage_map: Dict[str, int] = {}  # symbol -> leverage
         self._last_filled_quantity: Dict[str, Decimal] = {}  # exchange_order_id -> last filled qty
+        self._watched_symbols: List[str] = []  # symbols being actively traded
 
         # Subscribe to market data updates
         self._setup_event_listeners()
 
-        # Try to restore state from persistence, otherwise fetch from exchange
+        # Try to restore state from persistence, otherwise fetch positions from exchange.
+        # Note: open orders sync is deferred until the caller registers _watched_symbols
+        # and explicitly calls sync_initial_state(symbols=[...]).
         if not self._try_restore_state():
-            print("⚠️ [REAL] State file not found or failed to load. Syncing from exchange...")
+            print("⚠️ [REAL] State file not found or failed to load. Syncing positions from exchange...")
             self.sync_initial_state()
 
     def _setup_event_listeners(self) -> None:
@@ -315,7 +318,14 @@ class RealBroker:
                 return
 
             # Get fill details
-            fill_price = Decimal(str(exchange_order["price"]))
+            # CCXT uses 'average' for fill price, 'price' for limit price.
+            # Testnet raw uses 'avgPrice'.
+            fill_price_raw = exchange_order.get("average") or exchange_order.get("avgPrice") or exchange_order.get("price")
+            fill_price = Decimal(str(fill_price_raw)) if fill_price_raw else self.market_prices.get(order.symbol, Decimal("0"))
+            
+            # Safety: Ensure fill_price is not zero to avoid Position validation error
+            if fill_price == 0:
+                fill_price = self.market_prices.get(order.symbol, Decimal("1")) # Ultimate fallback
             fill_quantity = Decimal(str(exchange_order["filled"]))
             commission = Decimal("0")  # Get from exchange if available
 
@@ -324,6 +334,12 @@ class RealBroker:
                 commission = Decimal(str(trade.get("fee", {}).get("cost", 0)))
 
             # Create trade fill
+            ts_raw = exchange_order.get("timestamp")
+            fill_ts = (
+                datetime.fromtimestamp(ts_raw / 1000, tz=timezone.utc)
+                if ts_raw
+                else datetime.now(tz=timezone.utc)
+            )
             fill = TradeFill(
                 id=str(exchange_order["id"]),
                 order_id=order.id,
@@ -332,7 +348,7 @@ class RealBroker:
                 price=fill_price,
                 quantity=fill_quantity,
                 commission=commission,
-                timestamp=datetime.fromtimestamp(exchange_order["timestamp"] / 1000, tz=timezone.utc),
+                timestamp=fill_ts,
             )
 
             # Update order status
@@ -381,7 +397,15 @@ class RealBroker:
                 return
 
             # Get fill details
-            fill_price = Decimal(str(exchange_order.get("price", 0))) or self.market_prices.get(order.symbol, Decimal("0"))
+            # CCXT uses 'average' for fill price, 'price' for limit price.
+            # Testnet raw uses 'avgPrice'.
+            fill_price_raw = exchange_order.get("average") or exchange_order.get("avgPrice") or exchange_order.get("price")
+            fill_price = Decimal(str(fill_price_raw)) if fill_price_raw else self.market_prices.get(order.symbol, Decimal("0"))
+            
+            # Safety: Ensure fill_price is not zero to avoid Position validation error
+            if fill_price == 0:
+                fill_price = self.market_prices.get(order.symbol, Decimal("1")) # Ultimate fallback
+                
             fill_quantity = delta
             commission = Decimal("0")
 
@@ -391,6 +415,12 @@ class RealBroker:
                     commission += Decimal(str(trade.get("fee", {}).get("cost", 0)))
 
             # Create trade fill
+            ts_raw = exchange_order.get("timestamp") or exchange_order.get("updateTime")
+            fill_ts = (
+                datetime.fromtimestamp(float(ts_raw) / 1000, tz=timezone.utc)
+                if ts_raw
+                else datetime.now(tz=timezone.utc)
+            )
             fill = TradeFill(
                 id=str(exchange_order["id"]) + "_delta",
                 order_id=order.id,
@@ -399,7 +429,7 @@ class RealBroker:
                 price=fill_price,
                 quantity=fill_quantity,
                 commission=commission,
-                timestamp=datetime.fromtimestamp(float(exchange_order.get("timestamp", 0) or time.time() * 1000) / 1000, tz=timezone.utc),
+                timestamp=fill_ts,
             )
 
             # Update order status
@@ -478,24 +508,68 @@ class RealBroker:
                 # Same direction: increase position
                 position.increase(fill)
             else:
-                # Opposite direction: reduce or close position
-                position_side_fill = fill.model_copy(update={"side": current_side})
-                realized_pnl = position.decrease(position_side_fill)
+                # Opposite direction: reduce, close, or reverse position
+                fill_qty = fill.quantity
+                pos_qty = position.quantity
 
-                if position.is_closed:
-                    # Publish position closed event
+                if fill_qty < pos_qty:
+                    # Partial reduction
+                    position_side_fill = fill.model_copy(update={"side": current_side})
+                    realized_pnl = position.decrease(position_side_fill)
+                    print(f"📉 [REAL] Position Reduced: {symbol} by {fill_qty}, Realized PnL: {realized_pnl:.4f}")
+                elif fill_qty == pos_qty:
+                    # Full close
+                    position_side_fill = fill.model_copy(update={"side": current_side})
+                    realized_pnl = position.decrease(position_side_fill)
+                    print(f"🏁 [REAL] Position Closed: {symbol}, Realized PnL: {realized_pnl:.4f}")
                     self.event_bus.publish(
                         Event(
                             type=EventType.POSITION_CLOSED,
                             timestamp=self.clock.now(),
-                            data={
-                                "symbol": symbol,
-                                "realized_pnl": str(realized_pnl),
-                            },
+                            data={"symbol": symbol, "realized_pnl": str(realized_pnl)},
                             source="REAL",
                         )
                     )
                     del self.positions[symbol]
+                else:
+                    # REVERSAL: Fill quantity > Position quantity
+                    # 1. Close current position
+                    remnant_qty = fill_qty - pos_qty
+                    print(f"🔄 [REAL] Position Reversal Detected for {symbol}: {current_side} -> {new_side}")
+                    
+                    # Calculate PnL for the portion that closed the current position
+                    direction = 1 if current_side == Side.LONG else -1
+                    realized_pnl = (fill.price - position.entry_price) * pos_qty * direction
+                    
+                    # Close existing
+                    del self.positions[symbol]
+                    self.event_bus.publish(
+                        Event(
+                            type=EventType.POSITION_CLOSED,
+                            timestamp=self.clock.now(),
+                            data={"symbol": symbol, "realized_pnl": str(realized_pnl)},
+                            source="REAL",
+                        )
+                    )
+                    
+                    # 2. Open new position for remnant
+                    leverage = self.leverage_map.get(symbol, 1)
+                    self.positions[symbol] = PositionFactory.create_position(
+                        symbol=symbol,
+                        side=new_side,
+                        quantity=remnant_qty,
+                        entry_price=fill.price,
+                        leverage=leverage,
+                    )
+                    print(f"🚀 [REAL] Reversed Position Opened: {new_side} {remnant_qty} {symbol} @ {fill.price}")
+                    self.event_bus.publish(
+                        Event(
+                            type=EventType.POSITION_OPENED,
+                            timestamp=self.clock.now(),
+                            data={"symbol": symbol, "side": new_side.value, "quantity": str(remnant_qty)},
+                            source="REAL",
+                        )
+                    )
 
     def _handle_order_partial_fill(self, exchange_order_id: str, exchange_order: dict) -> None:
         """Handle partially filled order.
@@ -545,23 +619,48 @@ class RealBroker:
                         'symbol': binance_symbol,
                         'orderId': exchange_order_id
                     })
-                    # Convert to ccxt structure
+                    avg_price = float(raw_order.get("avgPrice", 0) or 0)
+                    # Normalize to a CCXT-compatible dict.
+                    # Expose avgPrice as both 'average' AND 'price' so fill handlers detect it.
                     exchange_order = {
                         "id": str(raw_order["orderId"]),
                         "status": raw_order["status"].lower(),
                         "filled": float(raw_order.get("executedQty", 0)),
-                        "price": float(raw_order.get("avgPrice", 0)),
-                        "timestamp": int(raw_order.get("updateTime", 0)),
+                        "average": avg_price,        # ← CCXT-style fill price
+                        "avgPrice": avg_price,        # ← raw Binance fallback
+                        "price": float(raw_order.get("price", 0) or 0),  # limit price
+                        "timestamp": int(raw_order.get("updateTime") or raw_order.get("time") or 0) or None,
+                        "updateTime": int(raw_order.get("updateTime", 0)),
                     }
                 except Exception as e:
-                     print(f"⚠️ [REAL] Raw Sync Failed: {e}")
-                     return
+                    print(f"⚠️ [REAL] Raw Sync Failed for {exchange_order_id}: {e}")
+                    return
             else:
-                exchange_order = self.exchange.fetch_order(exchange_order_id, binance_symbol)
-            status = exchange_order.get("status")
+                try:
+                    # For real Binance futures, fetch_order needs the CCXT unified symbol
+                    # (e.g. "FHE/USDT:USDT"), not the Binance raw format ("FHEUSDT")
+                    ccxt_symbol = symbol  # already in CCXT format from order.symbol
+                    exchange_order = self.exchange.fetch_order(exchange_order_id, ccxt_symbol)
+                    # Normalize: CCXT usually populates 'average' for filled orders.
+                    # If not, fall back to 'price' field.
+                    if not exchange_order.get("average") and exchange_order.get("price"):
+                        exchange_order["average"] = exchange_order["price"]
+                except Exception as e:
+                    print(f"⚠️ [REAL] fetch_order failed for {exchange_order_id}: {e}")
+                    return
+
+            status = exchange_order.get("status", "")
+            filled_qty = float(exchange_order.get("filled", 0) or 0)
+            # print(f"🔍 [SYNC] order={exchange_order_id} status={status} filled={filled_qty} avg={exchange_order.get('average')}")
 
             # Handle order status outside lock to avoid deadlock
-            if status == "filled":
+            # NOTE: CCXT Binance Futures returns "closed" (not "filled") for fully-filled orders.
+            # "filled" is returned by raw testnet API / some CCXT versions.
+            # We also check filled_qty > 0 as a safety net.
+            is_fully_filled = status in ("filled", "closed") and filled_qty > 0
+            is_partial = status in ("partially_filled", "open") and filled_qty > 0
+
+            if is_fully_filled:
                 # Order fully filled
                 with self._lock:
                     order = self.orders.get(exchange_order_id)
@@ -569,10 +668,11 @@ class RealBroker:
                         return
                     prev_filled = self._last_filled_quantity.get(exchange_order_id, Decimal("0"))
                 
-                current_filled = Decimal(str(exchange_order.get("filled", 0)))
+                current_filled = Decimal(str(filled_qty))
                 delta = current_filled - prev_filled
 
                 if delta > 0:
+                    print(f"✅ [SYNC] Order {exchange_order_id} FILLED: qty={current_filled} avg={exchange_order.get('average')}")
                     self._handle_order_fill_delta(exchange_order_id, exchange_order, delta)
                     with self._lock:
                         self._last_filled_quantity[exchange_order_id] = current_filled
@@ -582,7 +682,7 @@ class RealBroker:
                     if order:
                         order.status = OrderStatus.FILLED
 
-            elif status == "partially_filled":
+            elif is_partial:
                 self._handle_order_partial_fill(exchange_order_id, exchange_order)
 
             elif status in ["canceled", "cancelled"]:
@@ -650,110 +750,180 @@ class RealBroker:
         self._sync_thread.start()
         print(f"✅ [REAL] Order sync started (every {interval}s)")
 
-    def sync_initial_state(self) -> None:
-        """Sync initial state from exchange (Positions & Open Orders)."""
+    def sync_initial_state(self, symbols: Optional[List[str]] = None) -> None:
+        """Sync initial state from exchange (Positions & Open Orders).
+        
+        Args:
+            symbols: Optional list of symbols to filter open orders by.
+                     If None, uses self._watched_symbols.
+        """
         print("🔄 [REAL] Starting initial exchange sync...")
+        
+        # Use provided symbols, or fall back to watched symbols list
+        target_symbols = symbols or self._watched_symbols
+        
         try:
             # 1. Sync Positions
-            if self.testnet and self.market_type == "future":
+            if self.market_type == "future":
+                positions_data = []
                 try:
-                    # Fetch account info from Binance Futures
-                    account_info = self.exchange.fapiPrivateV2GetAccount()
-                    positions_data = account_info.get("positions", [])
+                    if self.testnet:
+                        # Fetch account info from Binance Futures Testnet
+                        account_info = self.exchange.fapiPrivateV2GetAccount()
+                        positions_data = account_info.get("positions", [])
+                    else:
+                        # Real Binance Futures Position Sync using CCXT
+                        positions_data = self.exchange.fetch_positions()
                     
                     with self._lock:
                         for pos in positions_data:
-                            amt = float(pos.get("positionAmt", 0))
-                            if amt != 0:
-                                symbol_raw = pos.get("symbol")
-                                # Construct symbol: e.g. ETHUSDT -> ETH/USDT:USDT
-                                # Simple heuristic: if ends with USDT, split
-                                if symbol_raw.endswith("USDT"):
-                                    base = symbol_raw[:-4]
-                                    std_symbol = f"{base}/USDT:USDT"
-                                else:
-                                    std_symbol = symbol_raw # Fallback
-                                
-                                side = Side.LONG if amt > 0 else Side.SHORT
-                                quantity = abs(Decimal(str(amt)))
-                                entry_price = Decimal(str(pos.get("entryPrice", 0)))
-                                leverage = int(pos.get("leverage", 1))
-                                
+                            # amt might be 'positionAmt' (raw) or 'contracts'/'amount' (CCXT)
+                            raw_amt = pos.get("positionAmt", pos.get("contracts", pos.get("amount")))
+                            if raw_amt is None:
+                                continue
+                            amt = float(raw_amt)
+                            if amt == 0:
+                                continue
+                            
+                            symbol_raw = pos.get("symbol") or ""
+                            
+                            # Standardize symbol
+                            if "/" in symbol_raw:
+                                std_symbol = symbol_raw
+                            elif symbol_raw.endswith("USDT"):
+                                base = symbol_raw[:-4]
+                                std_symbol = f"{base}/USDT:USDT"
+                            else:
+                                std_symbol = symbol_raw
+                            
+                            side = Side.LONG if amt > 0 else Side.SHORT
+                            quantity = abs(Decimal(str(amt)))
+                            
+                            # entryPrice: key differs between raw testnet and CCXT
+                            ep_raw = pos.get("entryPrice") or pos.get("entry_price") or "0"
+                            entry_price = Decimal(str(ep_raw))
+                            
+                            # leverage: may be None from CCXT if not set
+                            lev_raw = pos.get("leverage")
+                            lev = int(lev_raw) if lev_raw is not None else 1
+                            
+                            # Safety: don't create position with zero price
+                            if entry_price > 0:
                                 self.positions[std_symbol] = PositionFactory.create_position(
                                     symbol=std_symbol,
                                     side=side,
                                     quantity=quantity,
                                     entry_price=entry_price,
-                                    leverage=leverage,
+                                    leverage=lev,
                                 )
-                                self.leverage_map[std_symbol] = leverage
+                                self.leverage_map[std_symbol] = lev
                                 print(f"   Positions: {side.value} {quantity} {std_symbol} @ {entry_price}")
                 except Exception as e:
-                     print(f"⚠️ [REAL] Failed to sync positions: {e}")
+                    import traceback
+                    print(f"⚠️ [REAL] Failed to sync positions: {e}")
+                    traceback.print_exc()
 
             # 2. Sync Open Orders
             try:
                 open_orders = []
                 if self.testnet and self.market_type == "future":
-                    open_orders_raw = self.exchange.fapiPrivateGetOpenOrders()
-                    for o in open_orders_raw:
-                        # Raw response mapping
-                        open_orders.append({
-                            "id": str(o["orderId"]),
-                            "symbol": o["symbol"],
-                            "side": o["side"].lower(),
-                            "type": o["type"].lower(),
-                            "amount": float(o["origQty"]),
-                            "price": float(o["price"]),
-                            "filled": float(o["executedQty"]),
-                            "status": o["status"].lower(), # 'NEW' -> 'new'
-                            "timestamp": o["time"]
-                        })
+                    # Testnet: use raw endpoint filtered by symbol if provided
+                    if target_symbols:
+                        for sym in target_symbols:
+                            binance_sym = sym.replace("/", "").replace(":USDT", "")
+                            raw = self.exchange.fapiPrivateGetOpenOrders({"symbol": binance_sym})
+                            for o in raw:
+                                open_orders.append({
+                                    "id": str(o["orderId"]),
+                                    "symbol": o["symbol"],
+                                    "side": o["side"].lower(),
+                                    "type": o["type"].lower(),
+                                    "amount": float(o["origQty"]),
+                                    "price": float(o["price"]),
+                                    "filled": float(o["executedQty"]),
+                                    "status": o["status"].lower(),
+                                    "timestamp": o["time"]
+                                })
+                    else:
+                        # No specific symbol: fetch all (may have rate limit warning)
+                        raw = self.exchange.fapiPrivateGetOpenOrders()
+                        for o in raw:
+                            open_orders.append({
+                                "id": str(o["orderId"]),
+                                "symbol": o["symbol"],
+                                "side": o["side"].lower(),
+                                "type": o["type"].lower(),
+                                "amount": float(o["origQty"]),
+                                "price": float(o["price"]),
+                                "filled": float(o["executedQty"]),
+                                "status": o["status"].lower(),
+                                "timestamp": o["time"]
+                            })
+                elif self.market_type == "future":
+                    # Real Binance Futures: fetch per symbol to avoid rate limit warning
+                    if target_symbols:
+                        for sym in target_symbols:
+                            binance_sym = sym.replace("/", "").replace(":USDT", "")
+                            sym_orders = self.exchange.fetch_open_orders(binance_sym)
+                            open_orders.extend(sym_orders)
+                    else:
+                        # Cannot fetch all without symbol on real Binance (strict rate limits)
+                        # Suppress warning explicitly
+                        self.exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
+                        open_orders = self.exchange.fetch_open_orders()
                 else:
+                    # Spot
                     open_orders = self.exchange.fetch_open_orders()
                 
                 with self._lock:
+                    status_map = {
+                        "NEW": OrderStatus.SUBMITTED,
+                        "PARTIALLY_FILLED": OrderStatus.PARTIAL_FILLED,
+                        "FILLED": OrderStatus.FILLED,
+                        "CANCELED": OrderStatus.CANCELLED,
+                        "CANCELLED": OrderStatus.CANCELLED,
+                        "REJECTED": OrderStatus.REJECTED,
+                        "EXPIRED": OrderStatus.CANCELLED,
+                        # lowercase variants (fetch_open_orders CCXT returns lowercase status)
+                        "new": OrderStatus.SUBMITTED,
+                        "open": OrderStatus.SUBMITTED,
+                        "partially_filled": OrderStatus.PARTIAL_FILLED,
+                        "filled": OrderStatus.FILLED,
+                        "canceled": OrderStatus.CANCELLED,
+                        "cancelled": OrderStatus.CANCELLED,
+                        "rejected": OrderStatus.REJECTED,
+                        "expired": OrderStatus.CANCELLED,
+                    }
                     for o in open_orders:
-                        # Map status
-                        status_str = o["status"].upper() # 'NEW' -> 'NEW'
-                        status_map = {
-                            "NEW": OrderStatus.SUBMITTED,
-                            "PARTIALLY_FILLED": OrderStatus.PARTIAL_FILLED,
-                            "FILLED": OrderStatus.FILLED,
-                            "CANCELED": OrderStatus.CANCELLED,
-                            "REJECTED": OrderStatus.REJECTED,
-                            "EXPIRED": OrderStatus.CANCELLED
-                        }
-                        # Handle lowercase too if fetch_open_orders returns lowercase
-                        if status_str not in status_map:
-                             # Try lowercase keys just in case
-                             status_upper = status_str.upper()
-                             status = status_map.get(status_upper, OrderStatus.PENDING)
-                        else:
-                             status = status_map[status_str]
+                        status_str = str(o.get("status", ""))
+                        status = status_map.get(status_str, OrderStatus.PENDING)
                         
                         # Symbol handling
-                        symbol = o["symbol"]
-                        # standardize symbol if raw
-                        if not "/" in symbol and symbol.endswith("USDT"):
-                             symbol = f"{symbol[:-4]}/USDT:USDT"
+                        symbol = o.get("symbol", "")
+                        if symbol and "/" not in symbol and symbol.endswith("USDT"):
+                            symbol = f"{symbol[:-4]}/USDT:USDT"
 
+                        # amount: CCXT uses 'amount', raw uses 'origQty' (already normalized above)
+                        qty = o.get("amount", o.get("origQty", 0))
+                        price_val = o.get("price") or o.get("avgPrice")
+                        
                         order = Order(
                             id=str(o["id"]),
                             symbol=symbol,
                             side=o["side"],
-                            order_type=o["type"],
-                            quantity=Decimal(str(o["amount"])),
-                            price=Decimal(str(o["price"])) if o.get("price") else None,
+                            order_type=o.get("type", "limit"),
+                            quantity=Decimal(str(qty)),
+                            price=Decimal(str(price_val)) if price_val else None,
                             status=status,
                             filled_quantity=Decimal(str(o.get("filled", 0))),
-                            # timestamp handling simplified
                         )
                         self.orders[order.id] = order
                 if open_orders:
                     print(f"   Open Orders: {len(open_orders)} synced")
             except Exception as e:
-                 print(f"⚠️ [REAL] Failed to sync orders: {e}")
+                import traceback
+                print(f"⚠️ [REAL] Failed to sync orders: {e}")
+                traceback.print_exc()
 
             print("✅ [REAL] Initial sync complete.")
 
@@ -829,50 +999,61 @@ class RealBroker:
         with self._lock:
             return self.positions.get(symbol)
 
-    def get_balance(self) -> Decimal:
-        """Get account balance from exchange.
+    def get_wallet_balance(self) -> Decimal:
+        """Get wallet balance from exchange.
 
         Returns:
-            Current account balance including unrealized PnL
+            Current wallet balance (not including unrealized PnL)
         """
         try:
-            balance = Decimal("0")
-            
             # Special handling for Futures Testnet via raw API
             if self.testnet and self.market_type == "future":
                 try:
                     raw_balances = self.exchange.fapiPrivateV2GetBalance()
-                    # raw_balances is a list of dicts: [{'asset': 'USDT', 'balance': '...', ...}, ...]
                     usdt_bal = next((b for b in raw_balances if b['asset'] == 'USDT'), None)
                     if usdt_bal:
-                        # balance = wallet balance + unrealized pnl
-                        # availableBalance often includes pnl math.
-                        # Let's use balance (wallet) + crossUnPnl (if available) or similar.
-                        # Actually 'balance' in this endpoint is Wallet Balance.
-                        # We also need Unrealized PnL.
-                        wallet_balance = Decimal(str(usdt_bal.get('balance', 0)))
-                        cross_un_pnl = Decimal(str(usdt_bal.get('crossUnPnl', 0)))
-                        balance = wallet_balance + cross_un_pnl
-                        return balance
+                        return Decimal(str(usdt_bal.get('balance', 0)))
                 except Exception as e:
                     print(f"⚠️ [REAL] Raw Balance Fetch Failed: {e}")
-                    # Fallback to standard fetch_balance just in case
             
             account_info = self.exchange.fetch_balance()
+            usdt_data = account_info.get("USDT", {})
+            usdt_total = usdt_data.get("total", usdt_data.get("free", 0))
+            return Decimal(str(usdt_total))
+        except Exception as e:
+            print(f"❌ [REAL] 获取钱包余额失败: {e}")
+            return Decimal("0")
 
-            # Get USDT balance
-            usdt_balance = account_info.get("USDT", {}).get("free", 0)
-            balance = Decimal(str(usdt_balance))
+    def get_balance(self) -> Decimal:
+        """Get account equity from exchange.
 
-            # Add unrealized PnL from open positions
+        Returns:
+            Real-time equity (Wallet Balance + Unrealized PnL)
+        """
+        try:
+            balance = self.get_wallet_balance()
+            
+            # Special handling for Futures Testnet: add PnL from raw API if possible
+            if self.testnet and self.market_type == "future":
+                try:
+                    raw_balances = self.exchange.fapiPrivateV2GetBalance()
+                    usdt_bal = next((b for b in raw_balances if b['asset'] == 'USDT'), None)
+                    if usdt_bal:
+                        cross_un_pnl = Decimal(str(usdt_bal.get('crossUnPnl', 0)))
+                        return balance + cross_un_pnl
+                except:
+                    pass
+            
+            # Add locally tracked unrealized PnL
+            total_unrealized_pnl = Decimal("0")
             with self._lock:
                 for symbol, position in self.positions.items():
                     current_price = self.market_prices.get(symbol)
                     if current_price:
                         unrealized_pnl = position.calculate_unrealized_pnl(current_price)
-                        balance += unrealized_pnl
-
-            return balance
+                        total_unrealized_pnl += unrealized_pnl
+            
+            return balance + total_unrealized_pnl
         except Exception as e:
             print(f"❌ [REAL] 获取余额失败: {e}")
             return Decimal("0")
@@ -925,25 +1106,32 @@ class RealBroker:
         """
         try:
             total_equity = self.get_balance()
+            wallet_balance = self.get_wallet_balance()
 
             # Get initial balance (try to fetch from exchange or estimate)
             initial_balance = Decimal("10000")  # Default
             try:
-                account_info = self.exchange.fetch_balance()
-                total_wallet_balance = account_info.get("total", {}).get("USDT", 0)
-                if total_wallet_balance:
-                    initial_balance = Decimal(str(total_wallet_balance))
+                # Use wallet balance as initial if not provided
+                if wallet_balance > 0:
+                    initial_balance = wallet_balance
             except:
                 pass
 
             with self._lock:
                 positions_count = len(self.positions)
                 open_orders_count = len([o for o in self.orders.values() if o.is_open])
+                
+                # Calculate total unrealized pnl across all positions
+                total_pnl = Decimal("0")
+                for symbol, position in self.positions.items():
+                    price = self.market_prices.get(symbol)
+                    if price:
+                        total_pnl += position.calculate_unrealized_pnl(price)
 
             return {
-                "balance": total_equity,
+                "balance": wallet_balance,
                 "equity": total_equity,
-                "unrealized_pnl": Decimal("0"),
+                "unrealized_pnl": total_pnl,
                 "positions": positions_count,
                 "open_orders": open_orders_count,
                 "return_pct": ((total_equity - initial_balance) / initial_balance * 100) if initial_balance > 0 else Decimal("0"),
@@ -1059,6 +1247,75 @@ class RealBroker:
             for exchange_id, order in orders_to_cancel:
                 order.status = OrderStatus.CANCELLED
 
+    def close_all_positions(self, symbol: Optional[str] = None) -> bool:
+        """Close all open positions with market orders.
+
+        Submits a market order in the opposite direction for each open position
+        to achieve immediate liquidation at market price.
+
+        Args:
+            symbol: If provided, only close position for this symbol.
+                    If None, close ALL open positions.
+
+        Returns:
+            True if all positions were closed successfully, False if any failed.
+        """
+        with self._lock:
+            if symbol:
+                pos_to_close = {symbol: self.positions[symbol]} if symbol in self.positions else {}
+            else:
+                pos_to_close = dict(self.positions)
+
+        if not pos_to_close:
+            print(f"📝 [REAL] 没有需要平仓的持仓")
+            return True
+
+        print(f"🚨 [REAL] 强制平仓: {len(pos_to_close)} 个持仓...")
+        all_ok = True
+
+        for sym, position in pos_to_close.items():
+            try:
+                qty = position.quantity
+                if qty <= Decimal("0"):
+                    continue
+
+                # Close direction is opposite to position side
+                close_side = "sell" if position.side == Side.LONG else "buy"
+                binance_sym = sym.replace("/", "").replace(":USDT", "")
+
+                print(f"   ⚡ 市价平仓: {close_side.upper()} {qty} {sym}")
+
+                if self.market_type == "future":
+                    # Use reduceOnly for futures to ensure we're closing, not reversing
+                    response = self.exchange.create_order(
+                        symbol=binance_sym,
+                        type="MARKET",
+                        side=close_side,
+                        amount=float(qty),
+                        params={"reduceOnly": True},
+                    )
+                else:
+                    response = self.exchange.create_order(
+                        symbol=sym,
+                        type="market",
+                        side=close_side,
+                        amount=float(qty),
+                    )
+
+                print(f"   ✅ 平仓单已提交: id={response.get('id')}, status={response.get('status')}")
+
+                # Clear position from local state immediately
+                with self._lock:
+                    self.positions.pop(sym, None)
+
+            except Exception as e:
+                print(f"   ❌ [REAL] 平仓失败 {sym}: {e}")
+                import traceback; traceback.print_exc()
+                all_ok = False
+
+        return all_ok
+
+
     def _try_restore_state(self) -> None:
         """Try to restore state from persistence."""
         if not self.state_persistence:
@@ -1079,10 +1336,16 @@ class RealBroker:
                 # Restore risk manager state
                 if self.risk_manager and "risk_manager" in state:
                     self.risk_manager.restore_state(state["risk_manager"])
+                
+                # Restore metadata maps
+                self.leverage_map = self.state_persistence.restore_leverage(state)
+                self._last_filled_quantity = self.state_persistence.restore_last_filled(state)
             
             print("✅ [REAL] 状态恢复成功")
+            return True
         except Exception as e:
             print(f"❌ [REAL] 状态恢复失败: {e}")
+            return False
 
     def _save_state_periodically(self) -> None:
         """Save current state to persistence."""
@@ -1103,12 +1366,16 @@ class RealBroker:
                 # Make copies for thread safety
                 positions_copy = dict(self.positions)
                 orders_copy = dict(self.orders)
+                leverage_copy = dict(self.leverage_map)
+                last_filled_copy = dict(self._last_filled_quantity)
 
             self.state_persistence.save_state(
                 positions=positions_copy,
                 orders=orders_copy,
                 risk_manager_state=risk_state,
                 balance=balance,
+                leverage_map=leverage_copy,
+                last_filled_quantity=last_filled_copy,
             )
         except Exception as e:
             print(f"❌ [REAL] 状态保存失败: {e}")

@@ -39,6 +39,8 @@ class StatePersistence:
         orders: Dict[str, Order],
         risk_manager_state: dict,
         balance: Decimal,
+        leverage_map: Dict[str, int] = {},
+        last_filled_quantity: Dict[str, Decimal] = {},
     ) -> None:
         """Save current state to JSON.
 
@@ -62,6 +64,10 @@ class StatePersistence:
                         order_id: self._order_to_dict(order)
                         for order_id, order in orders.items()
                         if order.status in [OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.PARTIAL_FILLED]
+                    },
+                    "leverage_map": leverage_map,
+                    "last_filled_quantity": {
+                        oid: str(qty) for oid, qty in last_filled_quantity.items()
                     },
                 }
 
@@ -122,24 +128,27 @@ class StatePersistence:
         return positions
 
     def restore_orders(self, state: dict) -> Dict[str, Order]:
-        """Restore orders from loaded state.
-
-        Args:
-            state: Loaded state dictionary
-
-        Returns:
-            Dictionary of restored orders
-        """
+        """Restore orders from loaded state."""
         orders = {}
         orders_data = state.get("orders", {})
-
         for order_id, order_dict in orders_data.items():
             try:
                 orders[order_id] = self._dict_to_order(order_dict)
             except Exception as e:
                 print(f"⚠️ [PERSIST] 恢复订单失败 {order_id}: {e}")
-
         return orders
+
+    def restore_leverage(self, state: dict) -> Dict[str, int]:
+        """Restore leverage map from loaded state."""
+        return state.get("leverage_map", {})
+
+    def restore_last_filled(self, state: dict) -> Dict[str, Decimal]:
+        """Restore last filled quantities from loaded state."""
+        last_filled = {}
+        data = state.get("last_filled_quantity", {})
+        for oid, qty_str in data.items():
+            last_filled[oid] = Decimal(qty_str)
+        return last_filled
 
     def _position_to_dict(self, position: Position) -> dict:
         """Convert Position to serializable dictionary.
