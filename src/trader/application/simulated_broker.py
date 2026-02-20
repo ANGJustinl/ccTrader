@@ -309,9 +309,9 @@ class SimulatedBroker:
                     # 更新余额
                     self.balance += realized_pnl - fill.commission
                     
-                    self._publish_trade_events(symbol, current_side, position.entry_price, fill.price, fill.quantity, realized_pnl, fill.commission, closed=position.is_closed)
+                    self._publish_trade_events(symbol, current_side, position.entry_price, fill.price, fill.quantity, realized_pnl, fill.commission, closed=position.is_closed())
                     
-                    if position.is_closed:
+                    if position.is_closed():
                         del self.positions[symbol]
 
     def _publish_trade_events(self, symbol, side, entry_price, exit_price, quantity, pnl, commission, closed=False):
