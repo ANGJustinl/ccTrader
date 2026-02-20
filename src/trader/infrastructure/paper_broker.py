@@ -319,7 +319,7 @@ class PaperBroker:
                 # Update balance: add realized PnL, subtract commission
                 self.balance += realized_pnl - fill.commission
 
-                if position.is_closed:
+                if position.is_closed():
                     # Publish position closed event
                     self.event_bus.publish(
                         Event(

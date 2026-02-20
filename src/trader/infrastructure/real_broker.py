@@ -315,7 +315,12 @@ class RealBroker:
                 return
 
             # Get fill details
-            fill_price = Decimal(str(exchange_order["price"]))
+            # Priority: average fill price > reported order price > cached market price
+            raw_price = Decimal(str(exchange_order.get("average") or exchange_order.get("price") or 0))
+            fill_price = raw_price if raw_price > Decimal("0") else self.market_prices.get(order.symbol, Decimal("0"))
+            if fill_price == Decimal("0"):
+                print(f"⚠️ [REAL] Cannot determine fill price for order {exchange_order_id}, skipping fill")
+                return
             fill_quantity = Decimal(str(exchange_order["filled"]))
             commission = Decimal("0")  # Get from exchange if available
 
@@ -482,7 +487,7 @@ class RealBroker:
                 position_side_fill = fill.model_copy(update={"side": current_side})
                 realized_pnl = position.decrease(position_side_fill)
 
-                if position.is_closed:
+                if position.is_closed():
                     # Publish position closed event
                     self.event_bus.publish(
                         Event(
