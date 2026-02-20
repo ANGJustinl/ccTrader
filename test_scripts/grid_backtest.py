@@ -18,7 +18,7 @@ def run_grid_backtest():
     
     # Use recent data (last 7 days)
     end_date = datetime.now(timezone.utc)
-    start_date = end_date - timedelta(days=1)
+    start_date = end_date - timedelta(days=7)
     
     initial_balance = Decimal("5000")
     commission_rate = Decimal("0.0004")  # 0.04%
