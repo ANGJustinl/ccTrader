@@ -3,6 +3,7 @@
 
 Provides real trading capabilities using Binance Testnet API.
 """
+import logging
 import os
 import threading
 import time
@@ -11,6 +12,9 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import ccxt
+
+# 创建logger实例
+logger = logging.getLogger(__name__)
 from dotenv import load_dotenv
 
 from ..domain.position import Position
@@ -380,8 +384,16 @@ class RealBroker:
             if not order:
                 return
 
-            # Get fill details
-            fill_price = Decimal(str(exchange_order.get("price", 0))) or self.market_prices.get(order.symbol, Decimal("0"))
+            # 调试日志：打印订单结构
+            logger.debug(f"[ORDER_DEBUG] _handle_order_fill_delta exchange_order keys: {list(exchange_order.keys())}")
+            logger.debug(f"[ORDER_DEBUG] exchange_order: {exchange_order}")
+
+            # Get fill details - 优先使用CCXT标准字段 "average"
+            avg_price = exchange_order.get("average") or exchange_order.get("price")
+            if not avg_price and "info" in exchange_order:
+                # 从原始响应中获取
+                avg_price = exchange_order["info"].get("avgPrice")
+            fill_price = Decimal(str(avg_price or 0)) or self.market_prices.get(order.symbol, Decimal("0"))
             fill_quantity = delta
             commission = Decimal("0")
 
@@ -551,6 +563,7 @@ class RealBroker:
                         "status": raw_order["status"].lower(),
                         "filled": float(raw_order.get("executedQty", 0)),
                         "price": float(raw_order.get("avgPrice", 0)),
+                        "average": float(raw_order.get("avgPrice", 0)),  # 添加CCXT标准字段
                         "timestamp": int(raw_order.get("updateTime", 0)),
                     }
                 except Exception as e:
@@ -558,10 +571,15 @@ class RealBroker:
                      return
             else:
                 exchange_order = self.exchange.fetch_order(exchange_order_id, binance_symbol)
+            # 调试日志：打印订单结构
+            logger.debug(f"[ORDER_DEBUG] _sync_single_order exchange_order keys: {list(exchange_order.keys())}")
+            logger.debug(f"[ORDER_DEBUG] exchange_order: {exchange_order}")
+
             status = exchange_order.get("status")
 
             # Handle order status outside lock to avoid deadlock
-            if status == "filled":
+            # 修复：CCXT对Binance Futures的fetch_order，当订单完全成交时返回的status是"closed"而非"filled"
+            if status in ["filled", "closed"]:
                 # Order fully filled
                 with self._lock:
                     order = self.orders.get(exchange_order_id)
@@ -841,22 +859,39 @@ class RealBroker:
             # Special handling for Futures Testnet via raw API
             if self.testnet and self.market_type == "future":
                 try:
-                    raw_balances = self.exchange.fapiPrivateV2GetBalance()
-                    # raw_balances is a list of dicts: [{'asset': 'USDT', 'balance': '...', ...}, ...]
-                    usdt_bal = next((b for b in raw_balances if b['asset'] == 'USDT'), None)
-                    if usdt_bal:
-                        # balance = wallet balance + unrealized pnl
-                        # availableBalance often includes pnl math.
-                        # Let's use balance (wallet) + crossUnPnl (if available) or similar.
-                        # Actually 'balance' in this endpoint is Wallet Balance.
-                        # We also need Unrealized PnL.
-                        wallet_balance = Decimal(str(usdt_bal.get('balance', 0)))
-                        cross_un_pnl = Decimal(str(usdt_bal.get('crossUnPnl', 0)))
-                        balance = wallet_balance + cross_un_pnl
-                        return balance
+                    # Use fapiPrivateV2GetAccount to get total wallet balance
+                    # This includes all margin (position margin + available balance)
+                    account_info = self.exchange.fapiPrivateV2GetAccount()
+                    
+                    # totalWalletBalance includes all wallet balance across all assets
+                    total_wallet_balance = Decimal(str(account_info.get('totalWalletBalance', 0)))
+                    
+                    # totalUnrealizedProfit is the sum of all unrealized PnL
+                    total_unrealized_pnl = Decimal(str(account_info.get('totalUnrealizedProfit', 0)))
+                    
+                    # Total equity = total wallet balance + unrealized PnL
+                    balance = total_wallet_balance + total_unrealized_pnl
+                    
+                    return balance
                 except Exception as e:
-                    print(f"⚠️ [REAL] Raw Balance Fetch Failed: {e}")
-                    # Fallback to standard fetch_balance just in case
+                    print(f"⚠️ [REAL] Raw Account Fetch Failed: {e}, falling back to balance endpoint")
+                    # Fallback to fapiPrivateV2GetBalance
+                    try:
+                        raw_balances = self.exchange.fapiPrivateV2GetBalance()
+                        usdt_bal = next((b for b in raw_balances if b['asset'] == 'USDT'), None)
+                        if usdt_bal:
+                            # For balance endpoint, use availableBalance + position margin
+                            # availableBalance excludes position margin, so we need to add it back
+                            available_balance = Decimal(str(usdt_bal.get('availableBalance', 0)))
+                            cross_un_pnl = Decimal(str(usdt_bal.get('crossUnPnl', 0)))
+                            # totalMarginBalance = availableBalance + position margin
+                            # Since we don't have position margin directly, use balance - crossUnPnl
+                            wallet_balance = Decimal(str(usdt_bal.get('balance', 0)))
+                            balance = wallet_balance + cross_un_pnl
+                            return balance
+                    except Exception as e2:
+                        print(f"⚠️ [REAL] Fallback Balance Fetch Failed: {e2}")
+                    # Continue to standard fetch_balance fallback
             
             account_info = self.exchange.fetch_balance()
 
