@@ -21,6 +21,8 @@ dependencies = [
     "ta>=0.11.0",
     "openai>=1.0",
     "python-dotenv>=1.0",
+    "tenacity>=8.0",
+    "statsmodels>=0.14.0",
 ]
 
 [project.optional-dependencies]

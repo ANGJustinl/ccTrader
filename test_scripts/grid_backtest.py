@@ -14,11 +14,11 @@ def run_grid_backtest():
     """Run backtest for Dynamic Grid Strategy"""
     
     # 1. Configure Backtest
-    symbol = "PIPPINUSDT" # ETH often oscillates well
+    symbol = "FHEUSDT" # ETH often oscillates well
     
     # Use recent data (last 7 days)
     end_date = datetime.now(timezone.utc)
-    start_date = end_date - timedelta(days=7)
+    start_date = end_date - timedelta(days=1)
     
     initial_balance = Decimal("5000")
     commission_rate = Decimal("0.0004")  # 0.04%
@@ -67,7 +67,7 @@ def run_grid_backtest():
         trend_ema_period=50,
         grid_spacing="geometric",
         leverage=10,             # Aligned with live trading
-        capital_usage=0.5,       # Aligned with live trading
+        capital_usage=0.8,       # Aligned with live trading
     )
     # Dynamic position sizing will override position_size based on balance/leverage
     
