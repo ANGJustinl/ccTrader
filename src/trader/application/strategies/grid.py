@@ -30,7 +30,9 @@ class DynamicGridStrategy(BaseStrategy):
                  trend_ema_period: int = 50,
                  grid_spacing: str = "arithmetic",
                  leverage: int = 1,
-                 capital_usage: float = 0.5):  # Use 50% of account by default
+                 capital_usage: float = 0.5,
+                 sar_volume_threshold: float = 1.5,
+                 sar_trailing_stop_atr: float = 2.5):  # Use 50% of account by default
         super().__init__(name)
         self.symbol = symbol
         self.grid_number = grid_number
@@ -43,6 +45,8 @@ class DynamicGridStrategy(BaseStrategy):
         self.grid_spacing = grid_spacing
         self.leverage = leverage
         self.capital_usage = Decimal(str(capital_usage))
+        self.sar_volume_threshold = Decimal(str(sar_volume_threshold))
+        self.sar_trailing_stop_atr = Decimal(str(sar_trailing_stop_atr))
         self.trend_direction: Optional[str] = None # "UP" or "DOWN"
         
         # Grid State
@@ -345,13 +349,20 @@ class DynamicGridStrategy(BaseStrategy):
             triggered_sar = False
             sar_side = None
             
-            # 增加大级别趋势过滤 (EMA 50)，只有顺应大趋势的突破才做 SAR
-            if direction == "UP" and fast_ema > slow_ema and self.trend_direction == "UP":
-                print(f"📈 [SAR ACTIVATED] Bullish Breakout Confirmed (Fast {fast_ema:.2f} > Slow {slow_ema:.2f}, Trend: UP)")
+            # 趋势过滤逻辑
+            trend_ok = True
+            if self.trend_filter_enabled and self.trend_direction:
+                if direction == "UP" and self.trend_direction != "UP":
+                    trend_ok = False
+                elif direction == "DOWN" and self.trend_direction != "DOWN":
+                    trend_ok = False
+            
+            if direction == "UP" and fast_ema > slow_ema and trend_ok:
+                print(f"📈 [SAR ACTIVATED] Bullish Breakout Confirmed (Fast {fast_ema:.2f} > Slow {slow_ema:.2f}, Trend OK)")
                 triggered_sar = True
                 sar_side = "buy"
-            elif direction == "DOWN" and fast_ema < slow_ema and self.trend_direction == "DOWN":
-                print(f"📉 [SAR ACTIVATED] Bearish Breakout Confirmed (Fast {fast_ema:.2f} < Slow {slow_ema:.2f}, Trend: DOWN)")
+            elif direction == "DOWN" and fast_ema < slow_ema and trend_ok:
+                print(f"📉 [SAR ACTIVATED] Bearish Breakout Confirmed (Fast {fast_ema:.2f} < Slow {slow_ema:.2f}, Trend OK)")
                 triggered_sar = True
                 sar_side = "sell"
                 
@@ -370,11 +381,11 @@ class DynamicGridStrategy(BaseStrategy):
                     atr_vals = calculate_atr(highs, lows, closes, self.atr_period)
                     atr = atr_vals[-1] if atr_vals and atr_vals[-1] is not None else Decimal("0")
                     
-                    if atr > 0:
+                    if atr > 0 and self.sar_trailing_stop_atr > 0:
                         if sar_side == "buy":
-                            self.sar_trailing_stop = current_price - (atr * Decimal("2.5"))
+                            self.sar_trailing_stop = current_price - (atr * self.sar_trailing_stop_atr)
                         else:
-                            self.sar_trailing_stop = current_price + (atr * Decimal("2.5"))
+                            self.sar_trailing_stop = current_price + (atr * self.sar_trailing_stop_atr)
                     else:
                         self.sar_trailing_stop = None
                 else:
@@ -413,21 +424,23 @@ class DynamicGridStrategy(BaseStrategy):
         volume_ratio = current_vol / avg_vol
         print(f"📊 [SAR SIZE] Volume Ratio: {volume_ratio:.2f} (Curr: {current_vol:.0f}, Avg: {avg_vol:.0f})")
         
-        # 增加严格的成交量过滤：只有放量突破（至少 2.0 倍均量）才认为是真突破
-        if volume_ratio < Decimal("2.0"):
-            print(f"⚠️ [SAR SIZE] Volume Ratio {volume_ratio:.2f} < 2.0. Insufficient momentum for SAR.")
+        # 增加严格的成交量过滤：只有放量突破才认为是真突破
+        # 默认阈值 1.5，如果需要更严格可以调高
+        volume_threshold = getattr(self, 'sar_volume_threshold', Decimal("1.5"))
+        if volume_ratio < volume_threshold:
+            print(f"⚠️ [SAR SIZE] Volume Ratio {volume_ratio:.2f} < {volume_threshold}. Insufficient momentum for SAR.")
             return Decimal("0")
         
         # User defined Clamp Function
         # min_allocation = 10%
         # max_allocation = 30%
-        # Map [2.0, 5.0] -> [0.0, 1.0]
+        # Map [1.0, 5.0] -> [0.0, 1.0]
         
         min_alloc = Decimal("0.10")
         max_alloc = Decimal("0.30")
         
         base_ratio = float(volume_ratio)
-        normalized = (base_ratio - 2.0) / (5.0 - 2.0)
+        normalized = (base_ratio - 1.0) / (5.0 - 1.0)
         normalized = max(0.0, min(1.0, normalized))
         
         final_alloc = min_alloc + Decimal(str(normalized)) * (max_alloc - min_alloc)
@@ -505,34 +518,63 @@ class DynamicGridStrategy(BaseStrategy):
         # 2. TRAILING STOP & TREND REVERSAL
         exit_sar = False
         
+        # Calculate Unrealized PnL %
+        if side_str == "LONG":
+            unrealized_pnl_pct = (current_price - entry_price) / entry_price
+        else:
+            unrealized_pnl_pct = (entry_price - current_price) / entry_price
+            
+        # Dynamic ATR Multiplier: Tighten stop as profit grows to protect parabolic moves
+        current_atr_mult = Decimal(str(self.sar_trailing_stop_atr))
+        if current_atr_mult > 0:
+            if unrealized_pnl_pct > Decimal("0.10"):
+                current_atr_mult = min(current_atr_mult, Decimal("0.5")) # Lock in very tight
+            elif unrealized_pnl_pct > Decimal("0.05"):
+                current_atr_mult = min(current_atr_mult, Decimal("1.0")) # Lock in tight
+            elif unrealized_pnl_pct > Decimal("0.03"):
+                current_atr_mult = min(current_atr_mult, Decimal("1.5"))
+            elif unrealized_pnl_pct > Decimal("0.015"):
+                current_atr_mult = min(current_atr_mult, Decimal("2.0"))
+                
+        # Parabolic Exit: If in deep profit and price breaks fast EMA
+        parabolic_exit_threshold = Decimal("0.01")
+        
         if side_str == "LONG":
             # Update Trailing Stop
-            if atr > 0:
-                new_stop = current_price - (atr * Decimal("2.5")) # 调整为 2.5 ATR
+            if atr > 0 and current_atr_mult > 0:
+                new_stop = current_price - (atr * current_atr_mult)
                 if self.sar_trailing_stop is None or new_stop > self.sar_trailing_stop:
                     self.sar_trailing_stop = new_stop
             
             # Check Exits
             if self.sar_trailing_stop and current_price <= self.sar_trailing_stop:
-                print(f"📉 [SAR EXIT] Trailing Stop Hit! Price {current_price:.4f} <= {self.sar_trailing_stop:.4f}. Closing LONG.")
+                print(f"📉 [SAR EXIT] Trailing Stop Hit! Price {current_price:.4f} <= {self.sar_trailing_stop:.4f} (ATR Mult: {current_atr_mult:.1f}). Closing LONG.")
                 exit_sar = True
             elif fast is not None and slow is not None and fast < slow and current_price < slow:
                 print(f"📉 [SAR EXIT] Trend Reversal (Fast {fast:.4f} < Slow {slow:.4f} & Price < Slow). Closing LONG.")
                 exit_sar = True
+            # Parabolic Exit: If in deep profit and price breaks fast EMA
+            elif unrealized_pnl_pct > parabolic_exit_threshold and fast is not None and current_price < fast:
+                print(f"📉 [SAR EXIT] Parabolic Profit Protect (Price {current_price:.4f} < Fast EMA {fast:.4f}). Closing LONG.")
+                exit_sar = True
                 
         elif side_str == "SHORT":
             # Update Trailing Stop
-            if atr > 0:
-                new_stop = current_price + (atr * Decimal("2.5")) # 调整为 2.5 ATR
+            if atr > 0 and current_atr_mult > 0:
+                new_stop = current_price + (atr * current_atr_mult)
                 if self.sar_trailing_stop is None or new_stop < self.sar_trailing_stop:
                     self.sar_trailing_stop = new_stop
             
             # Check Exits
             if self.sar_trailing_stop and current_price >= self.sar_trailing_stop:
-                print(f"📈 [SAR EXIT] Trailing Stop Hit! Price {current_price:.4f} >= {self.sar_trailing_stop:.4f}. Closing SHORT.")
+                print(f"📈 [SAR EXIT] Trailing Stop Hit! Price {current_price:.4f} >= {self.sar_trailing_stop:.4f} (ATR Mult: {current_atr_mult:.1f}). Closing SHORT.")
                 exit_sar = True
             elif fast is not None and slow is not None and fast > slow and current_price > slow:
                 print(f"📈 [SAR EXIT] Trend Reversal (Fast {fast:.4f} > Slow {slow:.4f} & Price > Slow). Closing SHORT.")
+                exit_sar = True
+            # Parabolic Exit: If in deep profit and price breaks fast EMA
+            elif unrealized_pnl_pct > parabolic_exit_threshold and fast is not None and current_price > fast:
+                print(f"📈 [SAR EXIT] Parabolic Profit Protect (Price {current_price:.4f} > Fast EMA {fast:.4f}). Closing SHORT.")
                 exit_sar = True
                 
         if exit_sar:
